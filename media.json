@@ -1,0 +1,18 @@
+{
+  "settings": {
+    "title": "Rumcajs Media Center",
+    "subtitle": "Muzyka, filmy, zdjęcia i pliki w jednym miejscu",
+    "footer": "© 2026 Rumcajs Media Center"
+  },
+  "items": [
+    {
+      "type": "music",
+      "title": "Przykładowy utwór",
+      "subtitle": "Andrzej „Rumcajs”",
+      "description": "Usuń ten wpis po dodaniu pierwszego własnego utworu.",
+      "file": "./media/music/przykladowy-utwor.mp3",
+      "cover": "./covers/default-cover.svg",
+      "allowDownload": true
+    }
+  ]
+}

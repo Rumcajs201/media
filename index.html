@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#15110d">
+  <meta name="description" content="Rumcajs Media Center">
+  <title>Rumcajs Media Center</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./assets/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="./assets/icons/icon-192.png">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <div class="logo">R</div>
+      <div>
+        <p class="eyebrow">CENTRUM MULTIMEDIÓW</p>
+        <h1 id="siteTitle">Rumcajs Media Center</h1>
+        <p id="siteSubtitle">Muzyka, filmy, zdjęcia i pliki w jednym miejscu</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="toolbar">
+      <input id="searchInput" type="search" placeholder="Szukaj materiału…">
+      <button id="shareButton" class="button secondary" type="button">Udostępnij</button>
+    </section>
+
+    <nav id="categoryTabs" class="tabs" aria-label="Kategorie"></nav>
+
+    <section id="playerPanel" class="player-panel" hidden>
+      <img id="playerCover" src="./covers/default-cover.svg" alt="">
+      <div>
+        <p class="eyebrow">TERAZ ODTWARZANE</p>
+        <h2 id="playerTitle">—</h2>
+        <p id="playerMeta">—</p>
+      </div>
+      <audio id="audioPlayer" controls preload="metadata"></audio>
+      <video id="videoPlayer" controls preload="metadata" hidden></video>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <h2 id="sectionTitle">Wszystkie materiały</h2>
+        <span id="itemCount"></span>
+      </div>
+      <div id="mediaGrid" class="media-grid"></div>
+      <p id="emptyState" class="empty" hidden>Brak materiałów w tej kategorii.</p>
+      <p id="errorState" class="empty error" hidden>Nie udało się wczytać pliku media.json.</p>
+    </section>
+  </main>
+
+  <footer id="footerText">© 2026 Rumcajs Media Center</footer>
+
+  <template id="cardTemplate">
+    <article class="card">
+      <img class="card-cover" alt="">
+      <div class="card-body">
+        <span class="badge"></span>
+        <h3 class="card-title"></h3>
+        <p class="card-subtitle"></p>
+        <p class="card-description"></p>
+      </div>
+      <div class="card-actions"></div>
+    </article>
+  </template>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>
