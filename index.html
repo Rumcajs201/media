@@ -9,7 +9,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./assets/icons/icon-192.png">
   <link rel="apple-touch-icon" href="./assets/icons/icon-192.png">
-  <link rel="stylesheet" href="./style.css?v=5">
+  <link rel="stylesheet" href="./style.css?v=6">
 </head>
 <body>
   <header class="hero">
@@ -27,7 +27,36 @@
     <section class="toolbar">
       <input id="searchInput" type="search" placeholder="Szukaj materiału…">
       <button id="shareButton" class="button secondary" type="button">Udostępnij</button>
+      <button id="proposalButton" class="button secondary" type="button">Zaproponuj utwór</button>
       <button id="adminButton" class="button secondary" type="button">Dodaj utwór</button>
+    </section>
+
+    <section id="proposalPanel" class="admin-panel" hidden>
+      <div class="section-heading">
+        <div><p class="eyebrow">PROPOZYCJE UŻYTKOWNIKÓW</p><h2>Prześlij materiał do sprawdzenia</h2></div>
+        <button id="closeProposalButton" class="button ghost" type="button">Zamknij</button>
+      </div>
+      <p class="notice">Materiał nie zostanie opublikowany automatycznie. Najpierw trafi do administratora Rumcajs Media Center i pojawi się publicznie dopiero po ręcznym zaakceptowaniu.</p>
+      <div id="proposalLoginBox">
+        <p>Aby ograniczyć spam i nadużycia, zgłoszenie wymaga zalogowania kontem Google. Twój adres nie będzie wyświetlany publicznie.</p>
+        <button id="proposalLoginButton" class="button" type="button">Zaloguj przez Google</button>
+      </div>
+      <form id="proposalForm" hidden>
+        <label>Imię lub pseudonim<input id="proposalName" maxlength="80" required placeholder="np. Andrzej"></label>
+        <label>Adres do kontaktu<input id="proposalEmail" type="email" maxlength="160" placeholder="opcjonalnie"></label>
+        <label>Tytuł materiału<input id="proposalTitle" maxlength="140" required placeholder="Tytuł utworu"></label>
+        <label>Autor / wykonawca<input id="proposalAuthor" maxlength="140" required placeholder="Autor lub wykonawca"></label>
+        <label>Kategoria<select id="proposalCategory"><option value="ai">Muzyka AI</option><option value="mine">Własna muzyka</option><option value="other">Inna muzyka</option><option value="podcast">Podcast / nagranie głosowe</option></select></label>
+        <label>Opis<textarea id="proposalDescription" rows="4" maxlength="1000" placeholder="Krótko opisz materiał i dlaczego go przesyłasz"></textarea></label>
+        <label>Plik audio<input id="proposalFile" type="file" accept="audio/mpeg,audio/mp3,audio/mp4,audio/x-m4a,audio/wav,audio/flac,.mp3,.m4a,.wav,.flac" required></label>
+        <p class="small-note">Dozwolone formaty: MP3, M4A, WAV i FLAC. Maksymalny rozmiar pliku: 100 MB.</p>
+        <label class="check"><input id="proposalRights" type="checkbox" required><span>Oświadczam, że jestem autorem lub właścicielem praw do materiału albo mam zgodę na jego publiczne udostępnienie.</span></label>
+        <label class="check"><input id="proposalPublish" type="checkbox" required><span>Zgadzam się, aby zaakceptowany materiał został bezpłatnie i publicznie udostępniony w Rumcajs Media Center.</span></label>
+        <label class="check"><input id="proposalRules" type="checkbox" required><span>Rozumiem, że administrator może odrzucić materiał bez publikacji, a zgłoszenie nie gwarantuje jego dodania.</span></label>
+        <button id="proposalSubmit" class="button" type="submit">Wyślij propozycję</button>
+        <progress id="proposalProgress" value="0" max="100" hidden></progress>
+      </form>
+      <p id="proposalMessage" class="admin-message"></p>
     </section>
 
     <section id="adminPanel" class="admin-panel" hidden>
@@ -77,6 +106,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-storage-compat.js"></script>
   <script src="https://rumcajs-dashboard-7ca5e.web.app/__/firebase/init.js"></script>
-  <script src="./app.js?v=5" defer></script>
+  <script src="./app.js?v=6" defer></script>
 </body>
 </html>
