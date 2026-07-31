@@ -10,13 +10,24 @@ const els={
   audio:document.querySelector("#audioPlayer"),video:document.querySelector("#videoPlayer")
 };
 const state={items:[],category:"all",query:""};
-const labels={all:"Wszystko",music:"Muzyka",video:"Filmy",photo:"Zdjęcia",document:"Dokumenty",download:"Pliki"};
+const labels={
+  all:"Wszystko",
+  ai:"Muzyka AI",
+  moje:"Moja muzyka",
+  inne:"Inna muzyka",
+  music:"Muzyka",
+  video:"Filmy",
+  photo:"Zdjęcia",
+  document:"Dokumenty",
+  download:"Pliki"
+};
 
 function txt(v,f=""){return typeof v==="string"&&v.trim()?v.trim():f}
+function categoryKey(item){return txt(item.category,txt(item.type,"inne"))}
 function categoryLabel(c){return labels[c]||c}
 
 function renderTabs(){
-  const cats=["all",...new Set(state.items.map(i=>i.type).filter(Boolean))];
+  const cats=["all",...new Set(state.items.map(categoryKey).filter(Boolean))];
   els.tabs.replaceChildren();
   cats.forEach(cat=>{
     const b=document.createElement("button");
@@ -29,8 +40,9 @@ function renderTabs(){
 
 function filtered(){
   return state.items.filter(i=>{
-    const cat=state.category==="all"||i.type===state.category;
-    const hay=[i.title,i.subtitle,i.description,i.type].filter(Boolean).join(" ").toLocaleLowerCase("pl");
+    const itemCategory=categoryKey(i);
+    const cat=state.category==="all"||itemCategory===state.category;
+    const hay=[i.title,i.subtitle,i.description,i.type,i.category,categoryLabel(itemCategory)].filter(Boolean).join(" ").toLocaleLowerCase("pl");
     return cat&&hay.includes(state.query);
   });
 }
@@ -45,7 +57,7 @@ function renderItems(){
     const n=els.template.content.cloneNode(true);
     n.querySelector(".card-cover").src=txt(item.cover,"./covers/default-cover.svg");
     n.querySelector(".card-cover").alt=`Okładka: ${txt(item.title,"materiał")}`;
-    n.querySelector(".badge").textContent=categoryLabel(item.type);
+    n.querySelector(".badge").textContent=categoryLabel(categoryKey(item));
     n.querySelector(".card-title").textContent=txt(item.title,"Bez tytułu");
     n.querySelector(".card-subtitle").textContent=txt(item.subtitle);
     const d=n.querySelector(".card-description");d.textContent=txt(item.description);d.hidden=!d.textContent;
