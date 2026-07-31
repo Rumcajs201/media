@@ -27,47 +27,56 @@
     <section class="toolbar">
       <input id="searchInput" type="search" placeholder="Szukaj materiału…">
       <button id="shareButton" class="button secondary" type="button">Udostępnij</button>
+      <button id="adminButton" class="button secondary" type="button">Dodaj utwór</button>
+    </section>
+
+    <section id="adminPanel" class="admin-panel" hidden>
+      <div class="section-heading">
+        <div><p class="eyebrow">PANEL ADMINISTRATORA</p><h2>Dodaj nowy utwór</h2></div>
+        <button id="closeAdminButton" class="button ghost" type="button">Zamknij</button>
+      </div>
+      <div id="adminLoginBox">
+        <p>Zaloguj się tym samym kontem Google, którego używasz w Dashboardzie.</p>
+        <button id="adminLoginButton" class="button" type="button">Zaloguj przez Google</button>
+      </div>
+      <form id="uploadForm" hidden>
+        <label>Tytuł<input id="uploadTitle" required placeholder="np. Ania 4+2"></label>
+        <label>Wykonawca<input id="uploadSubtitle" placeholder="np. Rumcajs AI"></label>
+        <label>Kategoria<select id="uploadCategory"><option value="ai">Muzyka AI</option><option value="mine">Moja muzyka</option><option value="other">Inna muzyka</option></select></label>
+        <label>Opis<textarea id="uploadDescription" rows="3" placeholder="Krótki opis utworu"></textarea></label>
+        <label>Plik MP3<input id="uploadFile" type="file" accept="audio/mpeg,audio/mp3,.mp3" required></label>
+        <button id="uploadSubmit" class="button" type="submit">Prześlij i dodaj</button>
+        <progress id="uploadProgress" value="0" max="100" hidden></progress>
+      </form>
+      <p id="adminMessage" class="admin-message"></p>
     </section>
 
     <nav id="categoryTabs" class="tabs" aria-label="Kategorie"></nav>
 
     <section id="playerPanel" class="player-panel" hidden>
       <img id="playerCover" src="./covers/default-cover.svg" alt="">
-      <div>
-        <p class="eyebrow">TERAZ ODTWARZANE</p>
-        <h2 id="playerTitle">—</h2>
-        <p id="playerMeta">—</p>
-      </div>
+      <div><p class="eyebrow">TERAZ ODTWARZANE</p><h2 id="playerTitle">—</h2><p id="playerMeta">—</p></div>
       <audio id="audioPlayer" controls preload="metadata"></audio>
       <video id="videoPlayer" controls preload="metadata" hidden></video>
     </section>
 
     <section>
-      <div class="section-heading">
-        <h2 id="sectionTitle">Wszystkie materiały</h2>
-        <span id="itemCount"></span>
-      </div>
+      <div class="section-heading"><h2 id="sectionTitle">Wszystkie materiały</h2><span id="itemCount"></span></div>
       <div id="mediaGrid" class="media-grid"></div>
       <p id="emptyState" class="empty" hidden>Brak materiałów w tej kategorii.</p>
-      <p id="errorState" class="empty error" hidden>Nie udało się wczytać pliku media.json.</p>
+      <p id="errorState" class="empty error" hidden>Nie udało się wczytać materiałów.</p>
     </section>
   </main>
 
   <footer id="footerText">© 2026 Rumcajs Media Center</footer>
 
-  <template id="cardTemplate">
-    <article class="card">
-      <img class="card-cover" alt="">
-      <div class="card-body">
-        <span class="badge"></span>
-        <h3 class="card-title"></h3>
-        <p class="card-subtitle"></p>
-        <p class="card-description"></p>
-      </div>
-      <div class="card-actions"></div>
-    </article>
-  </template>
+  <template id="cardTemplate"><article class="card"><img class="card-cover" alt=""><div class="card-body"><span class="badge"></span><h3 class="card-title"></h3><p class="card-subtitle"></p><p class="card-description"></p></div><div class="card-actions"></div></article></template>
 
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-storage-compat.js"></script>
+  <script src="https://rumcajs-dashboard-7ca5e.web.app/__/firebase/init.js"></script>
   <script src="./app.js" defer></script>
 </body>
 </html>
