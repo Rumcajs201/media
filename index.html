@@ -9,7 +9,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./assets/icons/icon-192.png">
   <link rel="apple-touch-icon" href="./assets/icons/icon-192.png">
-  <link rel="stylesheet" href="./style.css?v=6">
+  <link rel="stylesheet" href="./style.css?v=7">
 </head>
 <body>
   <header class="hero">
@@ -25,10 +25,10 @@
 
   <main class="container">
     <section class="toolbar">
-      <input id="searchInput" type="search" placeholder="Szukaj materiału…">
+      <input id="searchInput" type="search" placeholder="Szukaj utworu, wykonawcy lub opisu…">
       <button id="shareButton" class="button secondary" type="button">Udostępnij</button>
       <button id="proposalButton" class="button secondary" type="button">Zaproponuj utwór</button>
-      <button id="adminButton" class="button secondary" type="button">Dodaj utwór</button>
+      <button id="adminButton" class="button secondary" type="button">+ Dodaj utwór</button>
     </section>
 
     <section id="proposalPanel" class="admin-panel" hidden>
@@ -46,7 +46,7 @@
         <label>Adres do kontaktu<input id="proposalEmail" type="email" maxlength="160" placeholder="opcjonalnie"></label>
         <label>Tytuł materiału<input id="proposalTitle" maxlength="140" required placeholder="Tytuł utworu"></label>
         <label>Autor / wykonawca<input id="proposalAuthor" maxlength="140" required placeholder="Autor lub wykonawca"></label>
-        <label>Kategoria<select id="proposalCategory"><option value="ai">Muzyka AI</option><option value="mine">Własna muzyka</option><option value="other">Inna muzyka</option><option value="podcast">Podcast / nagranie głosowe</option></select></label>
+        <label>Katalog<select id="proposalCategory"><option value="ai">Muzyka AI</option><option value="mine">Moja muzyka</option><option value="other">Inna muzyka</option><option value="podcast">Nagrania / podcasty</option><option value="effects">Dźwięki / efekty</option></select></label>
         <label>Opis<textarea id="proposalDescription" rows="4" maxlength="1000" placeholder="Krótko opisz materiał i dlaczego go przesyłasz"></textarea></label>
         <label>Plik audio<input id="proposalFile" type="file" accept="audio/mpeg,audio/mp3,audio/mp4,audio/x-m4a,audio/wav,audio/flac,.mp3,.m4a,.wav,.flac" required></label>
         <p class="small-note">Dozwolone formaty: MP3, M4A, WAV i FLAC. Maksymalny rozmiar pliku: 100 MB.</p>
@@ -69,9 +69,9 @@
         <button id="adminLoginButton" class="button" type="button">Zaloguj przez Google</button>
       </div>
       <form id="uploadForm" hidden>
-        <label>Tytuł<input id="uploadTitle" required placeholder="np. Ania 4+2"></label>
+        <label>Tytuł<input id="uploadTitle" required placeholder="np. Dla Lili"></label>
         <label>Wykonawca<input id="uploadSubtitle" placeholder="np. Rumcajs AI"></label>
-        <label>Kategoria<select id="uploadCategory"><option value="ai">Muzyka AI</option><option value="mine">Moja muzyka</option><option value="other">Inna muzyka</option></select></label>
+        <label>Katalog<select id="uploadCategory"><option value="ai">Muzyka AI</option><option value="mine">Moja muzyka</option><option value="other">Inna muzyka</option><option value="podcast">Nagrania / podcasty</option><option value="effects">Dźwięki / efekty</option></select></label>
         <label>Opis<textarea id="uploadDescription" rows="3" placeholder="Krótki opis utworu"></textarea></label>
         <label>Plik MP3<input id="uploadFile" type="file" accept="audio/mpeg,audio/mp3,.mp3" required></label>
         <button id="uploadSubmit" class="button" type="submit">Prześlij i dodaj</button>
@@ -80,7 +80,11 @@
       <p id="adminMessage" class="admin-message"></p>
     </section>
 
-    <nav id="categoryTabs" class="tabs" aria-label="Kategorie"></nav>
+    <section class="library-head">
+      <div><p class="eyebrow">BIBLIOTEKA</p><h2>Katalogi</h2></div>
+      <select id="sortSelect" aria-label="Sortowanie"><option value="newest">Najnowsze</option><option value="title">Tytuł A–Z</option><option value="artist">Wykonawca A–Z</option></select>
+    </section>
+    <nav id="categoryTabs" class="folder-grid" aria-label="Katalogi"></nav>
 
     <section id="playerPanel" class="player-panel" hidden>
       <img id="playerCover" src="./covers/default-cover.svg" alt="">
@@ -90,16 +94,29 @@
     </section>
 
     <section>
-      <div class="section-heading"><h2 id="sectionTitle">Wszystkie materiały</h2><span id="itemCount"></span></div>
-      <div id="mediaGrid" class="media-grid"></div>
-      <p id="emptyState" class="empty" hidden>Brak materiałów w tej kategorii.</p>
+      <div class="section-heading"><div><h2 id="sectionTitle">Wszystkie materiały</h2><span id="itemCount"></span></div><button id="backToFolders" class="button ghost small" type="button" hidden>← Katalogi</button></div>
+      <div id="mediaGrid" class="media-list"></div>
+      <p id="emptyState" class="empty" hidden>Brak materiałów w tym katalogu.</p>
       <p id="errorState" class="empty error" hidden>Nie udało się wczytać materiałów.</p>
     </section>
   </main>
 
   <footer id="footerText">© 2026 Rumcajs Media Center</footer>
 
-  <template id="cardTemplate"><article class="card"><img class="card-cover" alt=""><div class="card-body"><span class="badge"></span><h3 class="card-title"></h3><p class="card-subtitle"></p><p class="card-description"></p></div><div class="card-actions"></div></article></template>
+  <template id="cardTemplate">
+    <article class="track-row">
+      <button class="track-main" type="button" aria-expanded="false">
+        <span class="play-dot">▶</span>
+        <span class="track-text"><strong class="card-title"></strong><span class="card-subtitle"></span></span>
+        <span class="badge"></span>
+        <span class="chevron">⌄</span>
+      </button>
+      <div class="track-details" hidden>
+        <p class="card-description"></p>
+        <div class="card-actions"></div>
+      </div>
+    </article>
+  </template>
 
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
@@ -107,6 +124,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-storage-compat.js"></script>
   <script src="https://rumcajs-dashboard-7ca5e.web.app/__/firebase/init.js"></script>
   <script src="./auth-fix.js?v=1"></script>
-  <script src="./app.js?v=6" defer></script>
+  <script src="./app.js?v=7" defer></script>
 </body>
 </html>
