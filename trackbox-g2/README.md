@@ -19,4 +19,4 @@ GitHub Actions builds the sketch and publishes:
 - `trackbox-g2/firmware/version.txt`
 
 Normal boot keeps Wi-Fi off and runs the tachograph BLE/F912 baseline.
-Boot with BACK+CONFIRM enters OTA mode. Once Wi-Fi is connected, TrackBox checks `version.txt`; when a newer version is present, it downloads `latest.bin`, flashes it and restarts automatically. The web OTA page remains available as a fallback.
+Hold encoder PUSH, press RESET, release RESET, and keep PUSH held for about 1–2 seconds to enter OTA mode. Once Wi-Fi is connected, TrackBox checks `version.txt`; when a newer version is present, it downloads `latest.bin`, flashes it and restarts automatically. The web OTA page remains available as a fallback.
