@@ -53,7 +53,7 @@ jobs:
             exit 1
           fi
 
-          VERSION="$(grep -A1 'TB_FW_VERSION' trackbox-g2/TrackBox_Gen2/TrackBox_Gen2.ino | tail -n 1 | tr -d ' ";')"
+          VERSION="$(awk '/static const char\* TB_FW_VERSION/{getline; gsub(/[ ";]/,""); print; exit}' trackbox-g2/TrackBox_Gen2/TrackBox_Gen2.ino)"
 
           if [ -z "$VERSION" ]; then
             echo "Firmware version not found"
