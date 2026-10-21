@@ -1,0 +1,94 @@
+name: Build TrackBox G2 firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "trackbox-g2/TrackBox_Gen2/**"
+      - ".github/workflows/trackbox-g2-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "U8g2"
+          arduino-cli lib install "NimBLE-Arduino@2.5.1"
+
+      - name: Compile TrackBox Gen2
+        run: |
+          rm -rf build
+          mkdir -p build
+          arduino-cli compile             --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi"             --output-dir build             trackbox-g2/TrackBox_Gen2
+          echo "Build files:"
+          find build -maxdepth 1 -type f -printf "%f %s bytes\n" | sort
+
+      - name: Prepare published firmware
+        shell: bash
+        run: |
+          mkdir -p trackbox-g2/firmware
+
+          APP_BIN="$(find build -maxdepth 1 -type f -name '*.bin'             ! -name '*bootloader*'             ! -name '*partitions*'             ! -name '*merged*'             ! -name 'boot_app0.bin' | head -n 1)"
+
+          if [ -z "$APP_BIN" ]; then
+            echo "Application .bin not found"
+            exit 1
+          fi
+
+          VERSION="$(grep -A1 'TB_FW_VERSION' trackbox-g2/TrackBox_Gen2/TrackBox_Gen2.ino | tail -n 1 | tr -d ' ";')"
+
+          if [ -z "$VERSION" ]; then
+            echo "Firmware version not found"
+            exit 1
+          fi
+
+          cp "$APP_BIN" trackbox-g2/firmware/latest.bin
+          printf '%s\n' "$VERSION" > trackbox-g2/firmware/version.txt
+          sha256sum trackbox-g2/firmware/latest.bin | awk '{print $1}' > trackbox-g2/firmware/latest.sha256
+
+          echo "Firmware version: $VERSION"
+          echo "Firmware binary: $APP_BIN"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackBox_Gen2_firmware
+          path: |
+            trackbox-g2/firmware/latest.bin
+            trackbox-g2/firmware/version.txt
+            trackbox-g2/firmware/latest.sha256
+          retention-days: 30
+
+      - name: Publish latest firmware to repository
+        shell: bash
+        run: |
+          git config user.name "TrackBox Build Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add trackbox-g2/firmware/latest.bin trackbox-g2/firmware/version.txt trackbox-g2/firmware/latest.sha256
+
+          if git diff --cached --quiet; then
+            echo "Published firmware is unchanged."
+            exit 0
+          fi
+
+          VERSION="$(cat trackbox-g2/firmware/version.txt)"
+          git commit -m "TrackBox G2 firmware $VERSION [skip ci]"
+          git push
