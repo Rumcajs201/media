@@ -343,7 +343,8 @@ void showOdometer()
 // OTA PRZEZ ROUTER - TRYB SERWISOWY
 //
 // Uruchomienie:
-// podczas wlaczania trzymaj BACK + CONFIRM przez ok. 2 s.
+// jedna reka: trzymaj PUSH enkodera, nacisnij RESET,
+// pusc RESET i trzymaj PUSH jeszcze chwile.
 //
 // Normalna praca:
 // Wi-Fi NIE jest uruchamiane, wiec BLE tachografu pozostaje
@@ -363,7 +364,7 @@ static const char* OTA_HOSTNAME =
   "trackbox-g2";
 
 static const char* TB_FW_VERSION =
-  "2026.10.21.1";
+  "2026.10.21.2";
 
 static const char* OTA_VERSION_URL =
   "https://raw.githubusercontent.com/Rumcajs201/media/main/trackbox-g2/firmware/version.txt";
@@ -487,14 +488,12 @@ bool otaButtonPressed(
 }
 
 
-// Po wejsciu do OTA BACK i CONFIRM byly trzymane przez ok. 2 s.
-// Czekamy na ich pelne puszczenie, zeby pierwszy ekran OTA
+// Po wejsciu do OTA PUSH enkodera byl trzymany podczas RESET.
+// Czekamy na jego pelne puszczenie, zeby pierwszy ekran OTA
 // nie odziedziczyl stanu przycisku z kombinacji startowej.
 void otaWaitButtonsReleased()
 {
-  while (digitalRead(PIN_BACK) == LOW ||
-         digitalRead(PIN_CONFIRM) == LOW ||
-         digitalRead(PIN_ENC_PUSH) == LOW)
+  while (digitalRead(PIN_ENC_PUSH) == LOW)
   {
     delay(5);
   }
@@ -1679,7 +1678,7 @@ void otaStartWebServer(
         "TrackBox G2 OTA",
         "WiFi rozlaczone",
         "Restartuj OTA",
-        "BACK+OK przy starcie"
+        "PUSH + RESET"
       );
     }
 
@@ -1710,8 +1709,8 @@ void startOtaMode()
     "======================================"
   );
 
-  // Uzytkownik wszedl do OTA trzymajac BACK + CONFIRM.
-  // Najpierw wymagamy puszczenia przyciskow.
+  // Uzytkownik wszedl do OTA trzymajac PUSH podczas RESET.
+  // Najpierw wymagamy puszczenia przycisku.
   otaWaitButtonsReleased();
 
   WiFi.mode(
@@ -1908,27 +1907,27 @@ void startOtaMode()
 
 bool otaRequestedAtBoot()
 {
-  if (digitalRead(PIN_BACK) != LOW ||
-      digitalRead(PIN_CONFIRM) != LOW)
+  // RESET jest sprzetowy. Po restarcie sprawdzamy tylko
+  // przycisk PUSH enkodera (GPIO41).
+  if (digitalRead(PIN_ENC_PUSH) != LOW)
   {
     return false;
   }
 
   showMessage(
     "TrackBox G2 OTA",
-    "OTA?",
-    "Trzymaj oba",
-    "przyciski..."
+    "TRYB OTA?",
+    "Trzymaj PUSH",
+    "jeszcze chwile..."
   );
 
   uint32_t start =
     millis();
 
   while (millis() - start <
-         1800)
+         1000)
   {
-    if (digitalRead(PIN_BACK) != LOW ||
-        digitalRead(PIN_CONFIRM) != LOW)
+    if (digitalRead(PIN_ENC_PUSH) != LOW)
     {
       return false;
     }
@@ -3387,8 +3386,8 @@ void setup()
   // ========================================================
   // OTA SERVICE MODE PRZEZ ROUTER
   //
-  // Trzymaj BACK + CONFIRM podczas wlaczania zasilania
-  // przez ok. 2 sekundy.
+  // Jedna reka: trzymaj PUSH enkodera, nacisnij RESET,
+  // pusc RESET i trzymaj PUSH jeszcze ok. 1-2 sekundy.
   // Normalny start nie uruchamia Wi-Fi i nie zmienia BLE.
   // Tryb OTA laczy ESP jako klienta z wybranym routerem.
   // ========================================================
