@@ -5,19 +5,21 @@
 #include <esp_ota_ops.h>
 
 // ============================================================
-// TrackBox Gen2 - FRESH BLE DIAGNOSTIC PROBE
+// TrackBox Gen2 - DIAGNOSTIC HANDSHAKE PROBE
 // 2026-10-22
 //
 // Cel:
-//   1. sprawdzic czy SE5000 wysyla Credits do ESP,
-//   2. sprawdzic czy SE5000 wysyla jakikolwiek pakiet FIFO,
-//   3. NIE uzywac F912,
-//   4. odczytac dwa inne, oficjalne recordDataIdentifier:
-//        F90B = CurrentDateTime
-//        F190 = VehicleIdentificationNumber
+//   - NIE testujemy F912.
+//   - najpierw sprawdzamy transport BLE FIFO/Credits,
+//   - potem wykonujemy prawidlowa kolejnosc Appendix 8:
+//       1) StartCommunication  81 EE F0 81 E0
+//       2) StartDiagnosticSession Standard (0x81)
+//       3) ReadDataByIdentifier F90B (CurrentDateTime)
 //
-// Ten plik zostal napisany od nowa jako niezalezny tester.
-// Normalny runtime nie zawiera Wi-Fi / WebServer / Preferences.
+// Dodatkowo tester pokazuje:
+//   - czy FIFO wspiera Write / Write Without Response / Indication,
+//   - czy zapis do FIFO zwrocil OK,
+//   - ile Credits i FIFO rzeczywiscie przyszlo z tachografu.
 //
 // Recovery:
 //   trzymaj PUSH enkodera podczas RESET -> powrot do poprzedniej
@@ -25,7 +27,7 @@
 // ============================================================
 
 static const char* TB_FW_VERSION =
-  "2026.10.22.8-PROBE";
+  "2026.10.22.9-HANDSHAKE";
 
 // ============================================================
 // PINOUT - ZAMROZONY
@@ -66,12 +68,10 @@ void showMessage(
 )
 {
   drawHeader(title);
-
   if (l1.length()) { oled.setCursor(0, 25); oled.print(l1); }
   if (l2.length()) { oled.setCursor(0, 36); oled.print(l2); }
   if (l3.length()) { oled.setCursor(0, 47); oled.print(l3); }
   if (l4.length()) { oled.setCursor(0, 60); oled.print(l4); }
-
   oled.sendBuffer();
 }
 
@@ -96,7 +96,6 @@ static const char* UUID_DIAG_CREDITS =
 
 static const uint8_t VU_ADDRESS = 0xEE;
 static const uint8_t TESTER_ADDRESS = 0xF0;
-static const uint8_t SID_READ_DATA = 0x22;
 
 NimBLEClient* client = nullptr;
 NimBLERemoteService* diagService = nullptr;
@@ -129,16 +128,25 @@ uint16_t totalFifoRx = 0;
 uint16_t creditsForTx = 0;
 
 bool transportReady = false;
-bool autoProbeSent = false;
+bool autoHandshakeSent = false;
+
+bool fifoCanWrite = false;
+bool fifoCanWriteNR = false;
+bool fifoCanIndicate = false;
+
+bool lastTxOk = false;
+bool triedNoResponse = false;
+bool lastModeNoResponse = false;
 
 uint32_t transportReadyMs = 0;
 uint32_t requestMs = 0;
 
-static const uint8_t PROBE_NONE = 0;
-static const uint8_t PROBE_TIME_F90B = 1;
-static const uint8_t PROBE_VIN_F190 = 2;
+static const uint8_t HS_IDLE = 0;
+static const uint8_t HS_WAIT_STARTCOMM = 1;
+static const uint8_t HS_WAIT_SESSION = 2;
+static const uint8_t HS_WAIT_TIME = 3;
 
-uint8_t waitingProbe = PROBE_NONE;
+uint8_t hsState = HS_IDLE;
 
 // ============================================================
 // HELPERS
@@ -172,6 +180,19 @@ String rawLine(const uint8_t* data, size_t len, size_t start, size_t count)
   }
 
   return s;
+}
+
+String propLine()
+{
+  return String("W:") + (fifoCanWrite ? "Y" : "N") +
+         " NR:" + (fifoCanWriteNR ? "Y" : "N") +
+         " I:" + (fifoCanIndicate ? "Y" : "N");
+}
+
+String rxLine()
+{
+  return String("Crd:") + totalCreditsRx +
+         " FIFO:" + totalFifoRx;
 }
 
 bool buttonPressed(uint8_t pin)
@@ -309,13 +330,13 @@ class ProbeClientCallbacks : public NimBLEClientCallbacks
 ProbeClientCallbacks clientCallbacks;
 
 // ============================================================
-// SCAN
+// SCAN + CONNECT
 // ============================================================
 
 bool findTacho()
 {
   showMessage(
-    "DIAG PROBE",
+    "HANDSHAKE TEST",
     "1/5 SCAN",
     "Szukam SE5000..."
   );
@@ -352,18 +373,18 @@ bool findTacho()
       dev->getAddressType();
 
     showMessage(
-      "DIAG PROBE",
+      "HANDSHAKE TEST",
       "SE5000 FOUND",
       tachoName,
       String("RSSI ") + dev->getRSSI()
     );
 
-    delay(500);
+    delay(400);
     return true;
   }
 
   showMessage(
-    "DIAG PROBE ERROR",
+    "HANDSHAKE ERROR",
     "SE5000",
     "NIE ZNALEZIONY",
     "BACK=retry"
@@ -372,14 +393,10 @@ bool findTacho()
   return false;
 }
 
-// ============================================================
-// CONNECT + SECURITY
-// ============================================================
-
 bool connectTacho()
 {
   showMessage(
-    "DIAG PROBE",
+    "HANDSHAKE TEST",
     "2/5 CONNECT",
     tachoName
   );
@@ -411,7 +428,7 @@ bool connectTacho()
   if (!client->connect(addr))
   {
     showMessage(
-      "DIAG PROBE ERROR",
+      "HANDSHAKE ERROR",
       "CONNECT FAIL",
       "BACK=retry"
     );
@@ -420,7 +437,7 @@ bool connectTacho()
   }
 
   showMessage(
-    "DIAG PROBE",
+    "HANDSHAKE TEST",
     "3/5 SECURITY",
     "BLE link: OK"
   );
@@ -431,7 +448,7 @@ bool connectTacho()
   if (!secure)
   {
     showMessage(
-      "DIAG PROBE ERROR",
+      "HANDSHAKE ERROR",
       "SECURITY FAIL",
       "BACK=retry"
     );
@@ -440,20 +457,19 @@ bool connectTacho()
   }
 
   showMessage(
-    "DIAG PROBE",
+    "HANDSHAKE TEST",
     "SECURITY OK",
     NimBLEDevice::isBonded(
       client->getPeerAddress()
-    ) ? "Bond:Y" : "Bond:N",
-    "Szukam DIAG..."
+    ) ? "Bond:Y" : "Bond:N"
   );
 
-  delay(400);
+  delay(350);
   return true;
 }
 
 // ============================================================
-// TRANSPORT SETUP
+// TRANSPORT
 // ============================================================
 
 bool giveCreditsToTacho(uint8_t count)
@@ -471,7 +487,7 @@ bool giveCreditsToTacho(uint8_t count)
 bool setupTransport()
 {
   showMessage(
-    "DIAG PROBE",
+    "HANDSHAKE TEST",
     "4/5 SERVICE",
     "Diagnostics..."
   );
@@ -482,36 +498,34 @@ bool setupTransport()
   if (diagService == nullptr)
   {
     showMessage(
-      "DIAG PROBE ERROR",
+      "HANDSHAKE ERROR",
       "NO DIAG SERVICE",
       "BACK=retry"
     );
-
     return false;
   }
 
   diagFifo =
-    diagService->getCharacteristic(
-      UUID_DIAG_FIFO
-    );
+    diagService->getCharacteristic(UUID_DIAG_FIFO);
 
   diagCredits =
-    diagService->getCharacteristic(
-      UUID_DIAG_CREDITS
-    );
+    diagService->getCharacteristic(UUID_DIAG_CREDITS);
 
   if (diagFifo == nullptr ||
       diagCredits == nullptr)
   {
     showMessage(
-      "DIAG PROBE ERROR",
+      "HANDSHAKE ERROR",
       "CHAR MISSING",
       diagFifo ? "FIFO:Y" : "FIFO:N",
       diagCredits ? "CREDIT:Y" : "CREDIT:N"
     );
-
     return false;
   }
+
+  fifoCanWrite = diagFifo->canWrite();
+  fifoCanWriteNR = diagFifo->canWriteNoResponse();
+  fifoCanIndicate = diagFifo->canIndicate();
 
   bool fifoSub =
     diagFifo->subscribe(
@@ -530,28 +544,23 @@ bool setupTransport()
   if (!fifoSub || !creditSub)
   {
     showMessage(
-      "DIAG PROBE ERROR",
+      "HANDSHAKE ERROR",
       "SUBSCRIBE FAIL",
       fifoSub ? "FIFO:Y" : "FIFO:N",
       creditSub ? "CREDIT:Y" : "CREDIT:N"
     );
-
     return false;
   }
 
   delay(120);
 
-  bool grant =
-    giveCreditsToTacho(32);
-
-  if (!grant)
+  if (!giveCreditsToTacho(32))
   {
     showMessage(
-      "DIAG PROBE ERROR",
+      "HANDSHAKE ERROR",
       "TX CREDIT FAIL",
       "BACK=retry"
     );
-
     return false;
   }
 
@@ -559,143 +568,297 @@ bool setupTransport()
   transportReadyMs = millis();
 
   showMessage(
-    "DIAG PROBE",
-    "5/5 WAIT RX",
+    "HANDSHAKE READY",
+    propLine(),
     "TX grant:32",
-    "Czekam Credits...",
-    "z tachografu"
+    "Czekam Crd RX..."
   );
 
   return true;
 }
 
 // ============================================================
-// RDBI PROBES
+// TX FRAMES
 // ============================================================
 
-bool sendRdbi(uint16_t did, uint8_t kind)
+bool sendFrame(
+  const uint8_t* data,
+  size_t len,
+  bool withResponse,
+  uint8_t nextState,
+  const char* label
+)
 {
   if (client == nullptr ||
       !client->isConnected() ||
-      diagFifo == nullptr)
-    return false;
-
-  if (creditsForTx == 0)
-    return false;
-
-  uint8_t msg[8];
-
-  msg[0] = 0x80;
-  msg[1] = VU_ADDRESS;
-  msg[2] = TESTER_ADDRESS;
-  msg[3] = 0x03;
-  msg[4] = SID_READ_DATA;
-  msg[5] = (uint8_t)(did >> 8);
-  msg[6] = (uint8_t)(did & 0xFF);
-  msg[7] = kwpChecksum(msg, 7);
-
-  Serial.print("TX RDBI: ");
-  for (size_t i = 0; i < sizeof(msg); ++i)
+      diagFifo == nullptr ||
+      creditsForTx == 0)
   {
-    Serial.print(hexByte(msg[i]));
+    lastTxOk = false;
+    return false;
+  }
+
+  Serial.print("TX ");
+  Serial.print(label);
+  Serial.print(withResponse ? " WR: " : " WNR: ");
+
+  for (size_t i = 0; i < len; ++i)
+  {
+    Serial.print(hexByte(data[i]));
     Serial.print(" ");
   }
   Serial.println();
 
   bool ok =
     diagFifo->writeValue(
-      msg,
-      sizeof(msg),
-      true
+      data,
+      len,
+      withResponse
     );
+
+  lastTxOk = ok;
+  lastModeNoResponse = !withResponse;
 
   if (!ok)
     return false;
 
   creditsForTx--;
-  waitingProbe = kind;
+
+  hsState = nextState;
   requestMs = millis();
 
-  if (kind == PROBE_TIME_F90B)
-  {
-    showMessage(
-      "DIAG PROBE F90B",
-      "TX CurrentDateTime",
-      "Czekam FIFO...",
-      String("CrdRX:") + totalCreditsRx,
-      "PUSH=VIN"
-    );
-  }
-  else
-  {
-    showMessage(
-      "DIAG PROBE F190",
-      "TX VIN",
-      "Czekam FIFO...",
-      String("CrdRX:") + totalCreditsRx
-    );
-  }
+  showMessage(
+    "TX DIAG",
+    String(label) + (withResponse ? " WR" : " WNR"),
+    String("TX:") + (ok ? "OK" : "FAIL"),
+    propLine(),
+    rxLine()
+  );
 
   return true;
 }
 
+bool sendStartCommunication(bool withResponse)
+{
+  uint8_t msg[5] =
+  {
+    0x81,
+    VU_ADDRESS,
+    TESTER_ADDRESS,
+    0x81,
+    0x00
+  };
+
+  msg[4] = kwpChecksum(msg, 4);
+
+  return sendFrame(
+    msg,
+    sizeof(msg),
+    withResponse,
+    HS_WAIT_STARTCOMM,
+    "StartComm"
+  );
+}
+
+bool sendStartDiagnosticSession()
+{
+  uint8_t msg[7] =
+  {
+    0x80,
+    VU_ADDRESS,
+    TESTER_ADDRESS,
+    0x02,
+    0x10,
+    0x81,
+    0x00
+  };
+
+  msg[6] = kwpChecksum(msg, 6);
+
+  return sendFrame(
+    msg,
+    sizeof(msg),
+    true,
+    HS_WAIT_SESSION,
+    "StdSession"
+  );
+}
+
+bool sendTimeF90B()
+{
+  uint8_t msg[8] =
+  {
+    0x80,
+    VU_ADDRESS,
+    TESTER_ADDRESS,
+    0x03,
+    0x22,
+    0xF9,
+    0x0B,
+    0x00
+  };
+
+  msg[7] = kwpChecksum(msg, 7);
+
+  return sendFrame(
+    msg,
+    sizeof(msg),
+    true,
+    HS_WAIT_TIME,
+    "F90B Time"
+  );
+}
+
 // ============================================================
-// PROCESS RX
+// RX PROCESS
 // ============================================================
 
-void showProbePacket(
-  const uint8_t* data,
-  size_t len
-)
+bool isPositiveStartComm(const uint8_t* d, size_t len)
 {
-  String lineA = rawLine(data, len, 0, 6);
-  String lineB = rawLine(data, len, 6, 6);
+  return len >= 8 &&
+         d[0] == 0x80 &&
+         d[1] == TESTER_ADDRESS &&
+         d[2] == VU_ADDRESS &&
+         d[4] == 0xC1;
+}
+
+bool isPositiveSession(const uint8_t* d, size_t len)
+{
+  return len >= 7 &&
+         d[0] == 0x80 &&
+         d[1] == TESTER_ADDRESS &&
+         d[2] == VU_ADDRESS &&
+         d[4] == 0x50 &&
+         d[5] == 0x81;
+}
+
+bool isPositiveTime(const uint8_t* d, size_t len)
+{
+  return len >= 8 &&
+         d[0] == 0x80 &&
+         d[1] == TESTER_ADDRESS &&
+         d[2] == VU_ADDRESS &&
+         d[4] == 0x62 &&
+         d[5] == 0xF9 &&
+         d[6] == 0x0B;
+}
+
+void showRawRx(const uint8_t* data, size_t len, const char* title)
+{
+  showMessage(
+    title,
+    String("Len:") + len,
+    rxLine(),
+    rawLine(data, len, 0, 6),
+    rawLine(data, len, 6, 6)
+  );
+}
+
+void handleFifo(const uint8_t* data, size_t len)
+{
+  totalFifoRx++;
+
+  // Tachograf zuzywa jeden przyznany przez nas credit
+  // na pakiet wyslany do ESP. Oddajemy jeden.
+  giveCreditsToTacho(1);
+
+  Serial.print("RX FIFO: ");
+  for (size_t i = 0; i < len; ++i)
+  {
+    Serial.print(hexByte(data[i]));
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  if (hsState == HS_WAIT_STARTCOMM &&
+      isPositiveStartComm(data, len))
+  {
+    showRawRx(
+      data,
+      len,
+      "STARTCOMM RX OK"
+    );
+
+    hsState = HS_IDLE;
+
+    delay(90);
+
+    if (!sendStartDiagnosticSession())
+    {
+      showMessage(
+        "HANDSHAKE ERROR",
+        "Session TX FAIL",
+        propLine(),
+        rxLine()
+      );
+    }
+
+    return;
+  }
+
+  if (hsState == HS_WAIT_SESSION &&
+      isPositiveSession(data, len))
+  {
+    showRawRx(
+      data,
+      len,
+      "SESSION RX OK"
+    );
+
+    hsState = HS_IDLE;
+
+    delay(90);
+
+    if (!sendTimeF90B())
+    {
+      showMessage(
+        "HANDSHAKE ERROR",
+        "F90B TX FAIL",
+        propLine(),
+        rxLine()
+      );
+    }
+
+    return;
+  }
+
+  if (hsState == HS_WAIT_TIME &&
+      isPositiveTime(data, len))
+  {
+    hsState = HS_IDLE;
+
+    showMessage(
+      "DIAG PATH OK",
+      "F90B TIME RX",
+      rxLine(),
+      rawLine(data, len, 0, 6),
+      rawLine(data, len, 6, 6)
+    );
+
+    return;
+  }
+
+  hsState = HS_IDLE;
 
   if (len >= 7 &&
       data[0] == 0x80 &&
-      data[4] == 0x62)
-  {
-    uint16_t did =
-      ((uint16_t)data[5] << 8) |
-      data[6];
-
-    String name = "RDBI RESPONSE";
-
-    if (did == 0xF90B)
-      name = "F90B TIME RX";
-    else if (did == 0xF190)
-      name = "F190 VIN RX";
-
-    showMessage(
-      "TACHO -> ESP OK",
-      name,
-      String("FIFO packets:") + totalFifoRx,
-      lineA,
-      lineB
-    );
-  }
-  else if (len >= 7 &&
-           data[0] == 0x80 &&
-           data[4] == 0x7F)
+      data[4] == 0x7F)
   {
     showMessage(
-      "TACHO NEGATIVE RX",
+      "NEGATIVE RX",
       String("SID:") + hexByte(data[5]),
       String("NRC:") + hexByte(data[6]),
-      lineA,
-      lineB
+      rxLine(),
+      rawLine(data, len, 0, 6)
     );
+    return;
   }
-  else
-  {
-    showMessage(
-      "TACHO FIFO RX",
-      String("Len:") + len,
-      String("Packets:") + totalFifoRx,
-      lineA,
-      lineB
-    );
-  }
+
+  showRawRx(
+    data,
+    len,
+    "UNEXPECTED FIFO RX"
+  );
 }
 
 void processEvents()
@@ -736,8 +899,8 @@ void processEvents()
   if (rejected)
   {
     showMessage(
-      "DIAG PROBE ERROR",
-      "RX CREDIT = FF",
+      "HANDSHAKE ERROR",
+      "RX CREDIT=FF",
       "Tacho odrzucil"
     );
   }
@@ -748,11 +911,11 @@ void processEvents()
     creditsForTx += credit;
 
     showMessage(
-      "TACHO -> ESP OK",
-      "CREDIT RX",
+      "CREDIT RX OK",
       String("Now:") + credit,
-      String("Total:") + totalCreditsRx,
-      "To juz jest RX BLE"
+      String("TX credits:") + creditsForTx,
+      propLine(),
+      rxLine()
     );
 
     Serial.print("RX CREDIT=");
@@ -760,20 +923,7 @@ void processEvents()
   }
 
   if (haveFifo)
-  {
-    totalFifoRx++;
-
-    // Każdy pakiet FIFO odebrany od tachografu zużywa jeden
-    // przyznany przez nas credit. Oddajemy jeden credit.
-    giveCreditsToTacho(1);
-
-    waitingProbe = PROBE_NONE;
-
-    Serial.print("RX FIFO len=");
-    Serial.println(len);
-
-    showProbePacket(local, len);
-  }
+    handleFifo(local, len);
 }
 
 // ============================================================
@@ -783,8 +933,9 @@ void processEvents()
 void cleanupClient()
 {
   transportReady = false;
-  autoProbeSent = false;
-  waitingProbe = PROBE_NONE;
+  autoHandshakeSent = false;
+  triedNoResponse = false;
+  hsState = HS_IDLE;
 
   totalCreditsRx = 0;
   totalFifoRx = 0;
@@ -873,10 +1024,10 @@ void setup()
   }
 
   showMessage(
-    "FRESH DIAG PROBE",
-    "NO F912",
-    "Test F90B + F190",
-    "FW .8"
+    "HANDSHAKE PROBE",
+    "StartComm FIRST",
+    "Session -> F90B",
+    "FW .9"
   );
 
   delay(1200);
@@ -913,74 +1064,119 @@ void loop()
     disconnected = false;
 
     showMessage(
-      "DIAG PROBE ERROR",
+      "HANDSHAKE ERROR",
       "BLE DISCONNECT",
       String("Reason:") + disconnectReason,
       "BACK=retry"
     );
   }
 
-  // Po odebraniu Credits od tachografu wysylamy automatycznie
-  // pierwszy test: F90B CurrentDateTime.
+  // Appendix 8: najpierw StartCommunication.
   if (transportReady &&
-      !autoProbeSent &&
+      !autoHandshakeSent &&
       creditsForTx > 0 &&
       millis() - transportReadyMs > 700)
   {
-    autoProbeSent = true;
-    sendRdbi(0xF90B, PROBE_TIME_F90B);
+    autoHandshakeSent = true;
+    triedNoResponse = false;
+
+    if (!sendStartCommunication(true))
+    {
+      showMessage(
+        "HANDSHAKE ERROR",
+        "StartComm TX FAIL",
+        propLine(),
+        rxLine()
+      );
+    }
   }
 
-  if (waitingProbe != PROBE_NONE &&
-      millis() - requestMs > 3000)
+  if (hsState != HS_IDLE &&
+      millis() - requestMs > 1800)
   {
-    uint8_t timedOut = waitingProbe;
-    waitingProbe = PROBE_NONE;
+    uint8_t timedOut = hsState;
+
+    // Jednorazowo sprawdzamy drugi rodzaj zapisu BLE,
+    // ale tylko dla StartCommunication i tylko jesli FIFO
+    // faktycznie reklamuje Write Without Response.
+    if (timedOut == HS_WAIT_STARTCOMM &&
+        !triedNoResponse &&
+        fifoCanWriteNR &&
+        creditsForTx > 0)
+    {
+      triedNoResponse = true;
+
+      if (sendStartCommunication(false))
+      {
+        showMessage(
+          "STARTCOMM RETRY",
+          "Tryb WNR",
+          String("TX:") + (lastTxOk ? "OK" : "FAIL"),
+          propLine(),
+          rxLine()
+        );
+        delay(2);
+        return;
+      }
+    }
+
+    hsState = HS_IDLE;
+
+    String what = "UNKNOWN";
+    if (timedOut == HS_WAIT_STARTCOMM) what = "StartComm brak FIFO";
+    if (timedOut == HS_WAIT_SESSION) what = "Session brak FIFO";
+    if (timedOut == HS_WAIT_TIME) what = "F90B brak FIFO";
 
     showMessage(
-      "DIAG PROBE TIMEOUT",
-      timedOut == PROBE_TIME_F90B
-        ? "F90B brak FIFO"
-        : "F190 brak FIFO",
-      String("CrdRX:") + totalCreditsRx,
-      String("FIFO RX:") + totalFifoRx,
-      "PUSH=VIN CONF=TIME"
+      "HANDSHAKE TIMEOUT",
+      what,
+      String("TX:") + (lastTxOk ? "OK" : "FAIL") +
+        (lastModeNoResponse ? " WNR" : " WR"),
+      propLine(),
+      rxLine()
     );
   }
 
-  // CONFIRM -> ponow F90B
+  // CONFIRM -> StartCommunication od nowa przez Write Request.
   if (buttonPressed(PIN_CONFIRM))
   {
+    triedNoResponse = false;
+
     if (creditsForTx > 0)
-      sendRdbi(0xF90B, PROBE_TIME_F90B);
+      sendStartCommunication(true);
     else
       showMessage(
-        "DIAG PROBE",
+        "HANDSHAKE",
         "Brak TX credit",
-        String("CrdRX:") + totalCreditsRx,
-        String("FIFO:") + totalFifoRx
+        propLine(),
+        rxLine()
       );
   }
 
-  // PUSH -> test VIN F190
+  // PUSH -> reczny StartCommunication przez Write Without Response,
+  // jesli charakterystyka to obsluguje.
   if (buttonPressed(PIN_ENC_PUSH))
   {
-    if (creditsForTx > 0)
-      sendRdbi(0xF190, PROBE_VIN_F190);
+    if (fifoCanWriteNR &&
+        creditsForTx > 0)
+    {
+      triedNoResponse = true;
+      sendStartCommunication(false);
+    }
     else
+    {
       showMessage(
-        "DIAG PROBE",
-        "Brak TX credit",
-        String("CrdRX:") + totalCreditsRx,
-        String("FIFO:") + totalFifoRx
+        "HANDSHAKE",
+        "WNR niedostepne",
+        propLine(),
+        rxLine()
       );
+    }
   }
 
-  // BACK -> pelne ponowne polaczenie
+  // BACK -> pelne ponowne polaczenie.
   if (buttonPressed(PIN_BACK))
-  {
     startProbe();
-  }
 
   delay(2);
 }
