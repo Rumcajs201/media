@@ -134,14 +134,11 @@ bool autoProbeSent = false;
 uint32_t transportReadyMs = 0;
 uint32_t requestMs = 0;
 
-enum ProbeKind
-{
-  PROBE_NONE,
-  PROBE_TIME_F90B,
-  PROBE_VIN_F190
-};
+static const uint8_t PROBE_NONE = 0;
+static const uint8_t PROBE_TIME_F90B = 1;
+static const uint8_t PROBE_VIN_F190 = 2;
 
-ProbeKind waitingProbe = PROBE_NONE;
+uint8_t waitingProbe = PROBE_NONE;
 
 // ============================================================
 // HELPERS
@@ -576,7 +573,7 @@ bool setupTransport()
 // RDBI PROBES
 // ============================================================
 
-bool sendRdbi(uint16_t did, ProbeKind kind)
+bool sendRdbi(uint16_t did, uint8_t kind)
 {
   if (client == nullptr ||
       !client->isConnected() ||
@@ -937,7 +934,7 @@ void loop()
   if (waitingProbe != PROBE_NONE &&
       millis() - requestMs > 3000)
   {
-    ProbeKind timedOut = waitingProbe;
+    uint8_t timedOut = waitingProbe;
     waitingProbe = PROBE_NONE;
 
     showMessage(
