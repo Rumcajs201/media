@@ -12,7 +12,6 @@
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
-// AUTO OTA CLOUD: GitHub build + automatyczna aktualizacja przez Wi-Fi
 // ESP32-S3 + SH1106 128x64
 //
 // TEST:
@@ -136,33 +135,6 @@ enum State
 };
 
 State state = ST_BOOT;
-
-// Snapshot from the BLE disconnect callback. Shown on OLED because
-// Serial Monitor is unavailable during truck-side tests.
-volatile int lastBleDisconnectReason = -1;
-volatile uint8_t lastBleDisconnectStage = ST_BOOT;
-volatile bool lastBleAuthCompleted = false;
-volatile bool lastBleEncrypted = false;
-volatile bool lastBleLinkEstablished = false;
-volatile int8_t lastBleSecurityResult = -1; // -1 not attempted, 0 failed, 1 success
-volatile int lastBleOperationError = -1;
-
-const char* bleStageName(uint8_t stage)
-{
-  switch (stage)
-  {
-    case ST_SCAN: return "SCAN";
-    case ST_CONNECT: return "CONNECT";
-    case ST_SECURITY: return "SECURITY";
-    case ST_DIAG_SETUP: return "DIAG SETUP";
-    case ST_DIAG_READY: return "DIAG READY";
-    case ST_WAIT_ODOMETER: return "F912";
-    case ST_WAIT_STARTCOMM: return "STARTCOMM";
-    case ST_ODOMETER_OK: return "ODO OK";
-    case ST_ERROR: return "ERROR";
-    default: return "BOOT";
-  }
-}
 
 
 // ============================================================
@@ -365,8 +337,6 @@ void showOdometer()
 }
 
 
-
-// ============================================================
 // OTA PRZEZ ROUTER - TRYB SERWISOWY
 //
 // Uruchomienie:
@@ -391,7 +361,7 @@ static const char* OTA_HOSTNAME =
   "trackbox-g2";
 
 static const char* TB_FW_VERSION =
-  "2026.10.22.3";
+  "2026.10.22.4-GOLDEN";
 
 static const char* OTA_VERSION_URL =
   "https://raw.githubusercontent.com/Rumcajs201/media/main/trackbox-g2/firmware/version.txt";
@@ -2304,11 +2274,6 @@ class TachoClientCallbacks
       reason
     );
 
-    lastBleDisconnectReason = reason;
-    // Preserve the first failure stage when startEverything() already
-    // switched to ST_ERROR before this asynchronous callback fires.
-    if (state != ST_ERROR)
-      lastBleDisconnectStage = (uint8_t)state;
     disconnected = true;
   }
 
@@ -2369,11 +2334,8 @@ class TachoClientCallbacks
 
     Serial.print("Encrypted: ");
 
-    lastBleAuthCompleted = true;
-    lastBleEncrypted = connInfo.isEncrypted();
-
     Serial.println(
-      lastBleEncrypted
+      connInfo.isEncrypted()
       ? "YES"
       : "NO"
     );
@@ -2530,8 +2492,6 @@ bool connectTachograph()
     false
   );
 
-  // Restore the exact connection parameters from the proven F912 baseline.
-  // Keep diagnostics around the connection, but do not alter the BLE timing.
   client->setConnectionParams(
     12,
     24,
@@ -2553,21 +2513,14 @@ bool connectTachograph()
     "Connecting SE5000..."
   );
 
-  // Restore the proven baseline connect path.
-  // NimBLE 2.x default connect performs the MTU exchange automatically.
   if (!client->connect(address))
   {
-    lastBleOperationError = client->getLastError();
-    Serial.printf("CONNECT FAILED err=%d\n", lastBleOperationError);
-
     Serial.println(
       "CONNECT FAILED"
     );
 
     return false;
   }
-
-  lastBleLinkEstablished = true;
 
   Serial.println(
     "BLE CONNECT OK"
@@ -2596,12 +2549,6 @@ bool connectTachograph()
 
   bool secure =
     client->secureConnection();
-
-  lastBleSecurityResult = secure ? 1 : 0;
-  if (!secure)
-    lastBleOperationError = client->getLastError();
-  else if (client->isConnected())
-    lastBleEncrypted = client->getConnInfo().isEncrypted();
 
   Serial.print(
     "secureConnection: "
@@ -2657,8 +2604,7 @@ bool setupDiagnosticTransport()
     "=== DIAGNOSTICS SERVICE ==="
   );
 
-  diagService =
-    client->getService(
+  diagService =    client->getService(
       UUID_DIAG_SERVICE
     );
 
@@ -3273,15 +3219,6 @@ bool pressed(
 
 bool startEverything()
 {
-  disconnected = false;
-  lastBleDisconnectReason = -1;
-  lastBleDisconnectStage = ST_BOOT;
-  lastBleAuthCompleted = false;
-  lastBleEncrypted = false;
-  lastBleLinkEstablished = false;
-  lastBleSecurityResult = -1;
-  lastBleOperationError = -1;
-
   tachoCredits = 0;
 
   transportConfigured = false;
@@ -3295,7 +3232,6 @@ bool startEverything()
 
   if (!findTachograph())
   {
-    lastBleDisconnectStage = (uint8_t)state;
     state = ST_ERROR;
 
     showMessage(
@@ -3311,7 +3247,6 @@ bool startEverything()
 
   if (!connectTachograph())
   {
-    lastBleDisconnectStage = (uint8_t)state;
     state = ST_ERROR;
 
     showMessage(
@@ -3327,7 +3262,6 @@ bool startEverything()
 
   if (!setupDiagnosticTransport())
   {
-    lastBleDisconnectStage = (uint8_t)state;
     state = ST_ERROR;
 
     showMessage(
@@ -3445,30 +3379,14 @@ void setup()
   oled.begin();
 
 
-  // ========================================================
-  // OTA SERVICE MODE PRZEZ ROUTER
-  //
-  // Jedna reka: trzymaj PUSH enkodera, nacisnij RESET,
-  // pusc RESET i trzymaj PUSH jeszcze ok. 1-2 sekundy.
-  // Normalny start nie uruchamia Wi-Fi i nie zmienia BLE.
-  // Tryb OTA laczy ESP jako klienta z wybranym routerem.
-  // ========================================================
-
+  // DIAGNOSTIC GOLDEN BUILD:
+  // PUSH + RESET enters the isolated OTA service path.
+  // With PUSH released, execution continues directly into the
+  // historical BLE/F912 code that produced 149362.165 km.
   if (otaRequestedAtBoot())
   {
     startOtaMode();
   }
-
-
-  showMessage(
-    "TrackBox G2",
-    "AUTO OTA READY",
-    String("FW ") +
-      TB_FW_VERSION,
-    "F912 baseline"
-  );
-
-  delay(1500);
 
 
   showMessage(
@@ -3480,10 +3398,6 @@ void setup()
   // ========================================================
   // BLE
   // ========================================================
-
-  // Explicitly disable Wi-Fi on normal boot. OTA keeps its own
-  // service mode and saved network credentials remain untouched.
-  WiFi.mode(WIFI_OFF);
 
   Serial.println();
   Serial.println(
@@ -3665,30 +3579,10 @@ void loop()
 
     state = ST_ERROR;
 
-    char bleReason[24];
-    snprintf(
-      bleReason, sizeof(bleReason),
-      "Reason:%d (0x%X)",
-      lastBleDisconnectReason,
-      (unsigned)lastBleDisconnectReason
-    );
-
-    String securityInfo =
-      String("Link:") + (lastBleLinkEstablished ? "Y" : "N") +
-      " Sec:" + (lastBleSecurityResult == 1 ? "OK" :
-                 lastBleSecurityResult == 0 ? "FAIL" : "N/A") +
-      " E:" + (lastBleEncrypted ? "Y" : "N");
-
-    String operationInfo =
-      String("OpErr:") + String(lastBleOperationError) +
-      " BACK=retry";
-
     showMessage(
-      "TrackBox BLE ERROR",
-      bleReason,
-      String("Etap: ") + bleStageName(lastBleDisconnectStage),
-      securityInfo,
-      operationInfo
+      "TrackBox G2",
+      "BLE rozlaczone",
+      "BACK=connect"
     );
   }
 
@@ -3718,7 +3612,6 @@ void loop()
       "Potwierdz w tacho"
     );
   }
-
 
   if (passkeyEntryRequested)
   {
