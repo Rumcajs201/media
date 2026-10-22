@@ -5,36 +5,31 @@
 #include <esp_ota_ops.h>
 
 // ============================================================
-// TrackBox Gen2 - BLE / APP-LAYER FRAMING PROBE
+// TrackBox Gen2 - DUAL PORT PROBE
 // 2026-10-22
 //
-// Wnioski z .9-HANDSHAKE:
-//   Credits RX = 32
-//   FIFO supports Write + Indication
-//   Write Without Response = NO
-//   GATT write returns OK
-//   BUT StartCommunication full K-line frame -> FIFO RX = 0
+// Niezalezny test dwoch oficjalnych portow ITS:
+//   1) DOWNLOAD service (Appendix 7)
+//   2) DIAGNOSTICS service (Appendix 8)
 //
-// Ten test sprawdza granice warstw:
-// Bluetooth ITS transport replaces lower K-line layers.
-// FIFO is described as data delivered to the application layer.
-// Therefore testujemy Appendix 8 service payload WITHOUT
-// K-line FMT/TGT/SRC/LEN/checksum wrapper.
+// Dla kazdego portu:
+//   - wlaczamy FIFO indications + Credits indications
+//   - dajemy VU 32 credits
+//   - czekamy na credits od VU
+//   - jesli VU zaakceptowalo polaczenie, wysylamy
+//     StartCommunication: 81 EE F0 81 E0
+//   - liczymy odpowiedzi FIFO niezaleznie dla obu portow
 //
-// Sequence:
-//   A) 22 F9 0B      ReadDataByIdentifier TimeDate
-//   B) 81            StartCommunication SID only
-//   C) 10 81         StartDiagnosticSession Standard SID+subfunction
-//   D) 22 F9 0B      TimeDate again
-//
-// Any FIFO indication is displayed raw immediately.
+// To rozdziela:
+//   BLE / transport serial-port vs.
+//   parser DOWNLOAD vs parser DIAGNOSTICS.
 //
 // Recovery:
 //   hold encoder PUSH during RESET -> previous OTA partition.
 // ============================================================
 
 static const char* TB_FW_VERSION =
-  "2026.10.22.10-FRAMING";
+  "2026.10.22.11-DUALPORT";
 
 #define PIN_CONFIRM   38
 #define PIN_SDA       39
@@ -74,54 +69,83 @@ void showMessage(
   oled.sendBuffer();
 }
 
+// ============================================================
+// BLE UUIDs
+// ============================================================
+
 static const char* LOCAL_NAME =
   "TrackBox-G2-Rumcajs";
 
 static const char* TACHO_PREFIX =
   "SE5000-";
 
-static const char* UUID_DIAG_SERVICE =
+// Download serial port - official ITS transport spec
+static const char* UUID_DL_SERVICE =
+  "eef90782-55dd-4388-b80b-695aba7a69b5";
+
+static const char* UUID_DL_FIFO =
+  "29d3a479-1592-47df-80a4-afa742d369bb";
+
+static const char* UUID_DL_CREDITS =
+  "db9c4128-bff3-41fe-a306-fb6f9a8aeb2d";
+
+// Diagnostics serial port - official ITS transport spec
+static const char* UUID_DG_SERVICE =
   "fa213def-aef4-475c-bcea-0a8d69073efc";
 
-static const char* UUID_DIAG_FIFO =
+static const char* UUID_DG_FIFO =
   "e413960c-75ba-4ca9-8a67-99bc052a1b13";
 
-static const char* UUID_DIAG_CREDITS =
+static const char* UUID_DG_CREDITS =
   "e168d1a6-304f-42b4-ab96-4cd1d4efebd9";
 
 NimBLEClient* client = nullptr;
-NimBLERemoteService* diagService = nullptr;
-NimBLERemoteCharacteristic* diagFifo = nullptr;
-NimBLERemoteCharacteristic* diagCredits = nullptr;
 
 String tachoName;
 String tachoAddress;
 uint8_t tachoAddressType = 0;
 
-portMUX_TYPE eventMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-volatile bool creditEvent = false;
-volatile uint8_t creditValue = 0;
-volatile bool creditRejected = false;
+// ============================================================
+// Per-port state
+// ============================================================
 
-volatile bool fifoEvent = false;
-volatile size_t fifoLength = 0;
-uint8_t fifoBuffer[96];
+struct PortState
+{
+  NimBLERemoteService* service = nullptr;
+  NimBLERemoteCharacteristic* fifo = nullptr;
+  NimBLERemoteCharacteristic* credits = nullptr;
+
+  volatile bool creditEvent = false;
+  volatile uint8_t creditValue = 0;
+  volatile bool rejected = false;
+
+  volatile bool fifoEvent = false;
+  volatile size_t fifoLen = 0;
+  uint8_t fifoBuf[96];
+
+  uint16_t creditsRx = 0;
+  uint16_t fifoRx = 0;
+  uint16_t txCredits = 0;
+
+  bool setupOk = false;
+  bool startSent = false;
+  bool startTxOk = false;
+};
+
+PortState dl;
+PortState dg;
 
 volatile bool disconnected = false;
 volatile int disconnectReason = 0;
 
-uint16_t totalCreditsRx = 0;
-uint16_t totalFifoRx = 0;
-uint16_t creditsForTx = 0;
+uint32_t testStartMs = 0;
+bool finalShown = false;
 
-bool fifoCanWrite = false;
-bool fifoCanIndicate = false;
-
-bool transportReady = false;
-bool testRunning = false;
-uint8_t testStep = 0;
-uint32_t stepStartedMs = 0;
+// ============================================================
+// Helpers
+// ============================================================
 
 String hexByte(uint8_t v)
 {
@@ -141,24 +165,25 @@ String rawLine(const uint8_t* data, size_t len, size_t start, size_t count)
     if (s.length()) s += " ";
     s += hexByte(data[i]);
   }
+
   return s;
 }
 
-String counters()
+String portLine(const char* name, const PortState& p)
 {
-  return String("Crd:") + totalCreditsRx +
-         " FIFO:" + totalFifoRx;
+  return String(name) +
+         " C:" + p.creditsRx +
+         " F:" + p.fifoRx +
+         (p.rejected ? " REJ" : "");
 }
 
 bool buttonPressed(uint8_t pin)
 {
   static uint32_t lastConfirm = 0;
-  static uint32_t lastPush = 0;
   static uint32_t lastBack = 0;
 
   uint32_t* stamp = nullptr;
   if (pin == PIN_CONFIRM) stamp = &lastConfirm;
-  if (pin == PIN_ENC_PUSH) stamp = &lastPush;
   if (pin == PIN_BACK) stamp = &lastBack;
   if (stamp == nullptr) return false;
 
@@ -169,47 +194,93 @@ bool buttonPressed(uint8_t pin)
     while (digitalRead(pin) == LOW) delay(5);
     return true;
   }
+
   return false;
 }
 
-void fifoCallback(
+// ============================================================
+// Callbacks
+// ============================================================
+
+void dlFifoCb(
   NimBLERemoteCharacteristic* chr,
   uint8_t* data,
   size_t length,
   bool isNotify
 )
 {
-  if (data == nullptr || length == 0) return;
-  if (length > sizeof(fifoBuffer)) length = sizeof(fifoBuffer);
+  if (!data || length == 0) return;
+  if (length > sizeof(dl.fifoBuf)) length = sizeof(dl.fifoBuf);
 
-  portENTER_CRITICAL(&eventMux);
-  memcpy(fifoBuffer, data, length);
-  fifoLength = length;
-  fifoEvent = true;
-  portEXIT_CRITICAL(&eventMux);
+  portENTER_CRITICAL(&mux);
+  memcpy(dl.fifoBuf, data, length);
+  dl.fifoLen = length;
+  dl.fifoEvent = true;
+  portEXIT_CRITICAL(&mux);
 }
 
-void creditCallback(
+void dgFifoCb(
   NimBLERemoteCharacteristic* chr,
   uint8_t* data,
   size_t length,
   bool isNotify
 )
 {
-  if (data == nullptr || length < 1) return;
+  if (!data || length == 0) return;
+  if (length > sizeof(dg.fifoBuf)) length = sizeof(dg.fifoBuf);
 
-  portENTER_CRITICAL(&eventMux);
+  portENTER_CRITICAL(&mux);
+  memcpy(dg.fifoBuf, data, length);
+  dg.fifoLen = length;
+  dg.fifoEvent = true;
+  portEXIT_CRITICAL(&mux);
+}
+
+void dlCreditCb(
+  NimBLERemoteCharacteristic* chr,
+  uint8_t* data,
+  size_t length,
+  bool isNotify
+)
+{
+  if (!data || length < 1) return;
+
+  portENTER_CRITICAL(&mux);
+
   if (data[0] == 0xFF)
-    creditRejected = true;
+    dl.rejected = true;
   else
   {
-    creditValue = data[0];
-    creditEvent = true;
+    dl.creditValue = data[0];
+    dl.creditEvent = true;
   }
-  portEXIT_CRITICAL(&eventMux);
+
+  portEXIT_CRITICAL(&mux);
 }
 
-class ProbeCallbacks : public NimBLEClientCallbacks
+void dgCreditCb(
+  NimBLERemoteCharacteristic* chr,
+  uint8_t* data,
+  size_t length,
+  bool isNotify
+)
+{
+  if (!data || length < 1) return;
+
+  portENTER_CRITICAL(&mux);
+
+  if (data[0] == 0xFF)
+    dg.rejected = true;
+  else
+  {
+    dg.creditValue = data[0];
+    dg.creditEvent = true;
+  }
+
+  portEXIT_CRITICAL(&mux);
+}
+
+class ClientCallbacks : public NimBLEClientCallbacks
 {
   void onDisconnect(NimBLEClient* c, int reason) override
   {
@@ -234,23 +305,18 @@ class ProbeCallbacks : public NimBLEClientCallbacks
 
     NimBLEDevice::injectConfirmPasskey(info, true);
   }
-
-  void onPassKeyEntry(NimBLEConnInfo& info) override
-  {
-    showMessage(
-      "BLE PAIRING",
-      "Tacho chce PIN",
-      "Brak klawiatury"
-    );
-  }
 };
 
-ProbeCallbacks callbacks;
+ClientCallbacks callbacks;
+
+// ============================================================
+// BLE setup
+// ============================================================
 
 bool findTacho()
 {
   showMessage(
-    "FRAMING TEST",
+    "DUALPORT TEST",
     "SCAN SE5000..."
   );
 
@@ -270,7 +336,7 @@ bool findTacho()
     const NimBLEAdvertisedDevice* dev =
       results.getDevice(i);
 
-    if (dev == nullptr || !dev->haveName()) continue;
+    if (!dev || !dev->haveName()) continue;
 
     String name(dev->getName().c_str());
 
@@ -282,7 +348,7 @@ bool findTacho()
     tachoAddressType = dev->getAddressType();
 
     showMessage(
-      "FRAMING TEST",
+      "DUALPORT TEST",
       "SE5000 FOUND",
       tachoName
     );
@@ -292,17 +358,18 @@ bool findTacho()
   }
 
   showMessage(
-    "FRAMING ERROR",
+    "DUALPORT ERROR",
     "SE5000 not found",
     "BACK=retry"
   );
+
   return false;
 }
 
 bool connectTacho()
 {
   client = NimBLEDevice::createClient();
-  if (client == nullptr) return false;
+  if (!client) return false;
 
   client->setClientCallbacks(&callbacks, false);
   client->setConnectionParams(12, 24, 0, 200);
@@ -316,14 +383,14 @@ bool connectTacho()
   if (!client->connect(addr))
   {
     showMessage(
-      "FRAMING ERROR",
+      "DUALPORT ERROR",
       "CONNECT FAIL"
     );
     return false;
   }
 
   showMessage(
-    "FRAMING TEST",
+    "DUALPORT TEST",
     "BLE connected",
     "Security..."
   );
@@ -331,7 +398,7 @@ bool connectTacho()
   if (!client->secureConnection())
   {
     showMessage(
-      "FRAMING ERROR",
+      "DUALPORT ERROR",
       "SECURITY FAIL"
     );
     return false;
@@ -340,282 +407,136 @@ bool connectTacho()
   return true;
 }
 
-bool grantCredits(uint8_t count)
+bool grantCredits(PortState& p, uint8_t count)
 {
-  if (diagCredits == nullptr) return false;
-  return diagCredits->writeValue(&count, 1, true);
+  if (!p.credits) return false;
+  return p.credits->writeValue(&count, 1, true);
 }
 
-bool setupTransport()
-{
-  diagService =
-    client->getService(UUID_DIAG_SERVICE);
-
-  if (diagService == nullptr)
-  {
-    showMessage(
-      "FRAMING ERROR",
-      "NO DIAG SERVICE"
-    );
-    return false;
-  }
-
-  diagFifo =
-    diagService->getCharacteristic(UUID_DIAG_FIFO);
-
-  diagCredits =
-    diagService->getCharacteristic(UUID_DIAG_CREDITS);
-
-  if (diagFifo == nullptr ||
-      diagCredits == nullptr)
-  {
-    showMessage(
-      "FRAMING ERROR",
-      "CHAR MISSING"
-    );
-    return false;
-  }
-
-  fifoCanWrite = diagFifo->canWrite();
-  fifoCanIndicate = diagFifo->canIndicate();
-
-  bool s1 =
-    diagFifo->subscribe(false, fifoCallback, true);
-
-  bool s2 =
-    diagCredits->subscribe(false, creditCallback, true);
-
-  if (!s1 || !s2)
-  {
-    showMessage(
-      "FRAMING ERROR",
-      "SUBSCRIBE FAIL"
-    );
-    return false;
-  }
-
-  delay(120);
-
-  if (!grantCredits(32))
-  {
-    showMessage(
-      "FRAMING ERROR",
-      "CREDIT TX FAIL"
-    );
-    return false;
-  }
-
-  transportReady = true;
-
-  showMessage(
-    "FRAMING READY",
-    String("W:") + (fifoCanWrite ? "Y" : "N") +
-      " I:" + (fifoCanIndicate ? "Y" : "N"),
-    "Waiting Crd RX..."
-  );
-
-  return true;
-}
-
-bool txRaw(
-  const uint8_t* data,
-  size_t len,
+bool setupPort(
+  PortState& p,
+  const char* serviceUuid,
+  const char* fifoUuid,
+  const char* creditsUuid,
+  notify_callback fifoCb,
+  notify_callback creditCb,
   const char* label
 )
 {
-  if (diagFifo == nullptr ||
-      client == nullptr ||
-      !client->isConnected() ||
-      creditsForTx == 0)
+  p.service = client->getService(serviceUuid);
+
+  if (!p.service)
+  {
+    Serial.print(label);
+    Serial.println(" service missing");
+    return false;
+  }
+
+  p.fifo = p.service->getCharacteristic(fifoUuid);
+  p.credits = p.service->getCharacteristic(creditsUuid);
+
+  if (!p.fifo || !p.credits)
+  {
+    Serial.print(label);
+    Serial.println(" chars missing");
+    return false;
+  }
+
+  bool s1 = p.fifo->subscribe(false, fifoCb, true);
+  bool s2 = p.credits->subscribe(false, creditCb, true);
+
+  if (!s1 || !s2)
+  {
+    Serial.print(label);
+    Serial.println(" subscribe failed");
+    return false;
+  }
+
+  delay(100);
+
+  if (!grantCredits(p, 32))
+  {
+    Serial.print(label);
+    Serial.println(" grant credits failed");
+    return false;
+  }
+
+  p.setupOk = true;
+  return true;
+}
+
+bool sendStartComm(PortState& p, const char* label)
+{
+  if (!p.setupOk ||
+      !p.fifo ||
+      p.txCredits == 0)
     return false;
 
+  const uint8_t msg[5] =
+  {
+    0x81, 0xEE, 0xF0, 0x81, 0xE0
+  };
+
   bool ok =
-    diagFifo->writeValue(
-      data,
-      len,
+    p.fifo->writeValue(
+      msg,
+      sizeof(msg),
       true
     );
 
+  p.startSent = true;
+  p.startTxOk = ok;
+
+  if (ok) p.txCredits--;
+
   Serial.print("TX ");
   Serial.print(label);
-  Serial.print(": ");
-
-  for (size_t i = 0; i < len; ++i)
-  {
-    Serial.print(hexByte(data[i]));
-    Serial.print(" ");
-  }
-
-  Serial.print(" -> ");
+  Serial.print(" StartComm -> ");
   Serial.println(ok ? "OK" : "FAIL");
-
-  if (ok) creditsForTx--;
-
-  showMessage(
-    "APP PAYLOAD TX",
-    label,
-    String("TX:") + (ok ? "OK" : "FAIL"),
-    rawLine(data, len, 0, 8),
-    counters()
-  );
 
   return ok;
 }
 
-void runStep(uint8_t step)
+void resetStates()
 {
-  testStep = step;
-  stepStartedMs = millis();
+  dl.service = nullptr;
+  dl.fifo = nullptr;
+  dl.credits = nullptr;
+  dl.creditEvent = false;
+  dl.creditValue = 0;
+  dl.rejected = false;
+  dl.fifoEvent = false;
+  dl.fifoLen = 0;
+  dl.creditsRx = 0;
+  dl.fifoRx = 0;
+  dl.txCredits = 0;
+  dl.setupOk = false;
+  dl.startSent = false;
+  dl.startTxOk = false;
 
-  if (step == 1)
-  {
-    const uint8_t p[] = {0x22, 0xF9, 0x0B};
-    txRaw(p, sizeof(p), "A F90B app");
-    return;
-  }
+  dg.service = nullptr;
+  dg.fifo = nullptr;
+  dg.credits = nullptr;
+  dg.creditEvent = false;
+  dg.creditValue = 0;
+  dg.rejected = false;
+  dg.fifoEvent = false;
+  dg.fifoLen = 0;
+  dg.creditsRx = 0;
+  dg.fifoRx = 0;
+  dg.txCredits = 0;
+  dg.setupOk = false;
+  dg.startSent = false;
+  dg.startTxOk = false;
 
-  if (step == 2)
-  {
-    const uint8_t p[] = {0x81};
-    txRaw(p, sizeof(p), "B StartComm");
-    return;
-  }
-
-  if (step == 3)
-  {
-    const uint8_t p[] = {0x10, 0x81};
-    txRaw(p, sizeof(p), "C StdSession");
-    return;
-  }
-
-  if (step == 4)
-  {
-    const uint8_t p[] = {0x22, 0xF9, 0x0B};
-    txRaw(p, sizeof(p), "D F90B app");
-    return;
-  }
-
-  testRunning = false;
-
-  showMessage(
-    "FRAMING RESULT",
-    "No FIFO response",
-    "all app variants",
-    counters(),
-    "CONF=again"
-  );
-}
-
-void handleFifo(
-  const uint8_t* data,
-  size_t len
-)
-{
-  totalFifoRx++;
-  grantCredits(1);
-
-  testRunning = false;
-
-  showMessage(
-    "FIFO RESPONSE!",
-    String("Step:") + testStep,
-    String("Len:") + len,
-    rawLine(data, len, 0, 6),
-    rawLine(data, len, 6, 6)
-  );
-
-  Serial.print("RX FIFO: ");
-  for (size_t i = 0; i < len; ++i)
-  {
-    Serial.print(hexByte(data[i]));
-    Serial.print(" ");
-  }
-  Serial.println();
-}
-
-void processEvents()
-{
-  bool haveCredit = false;
-  uint8_t credit = 0;
-  bool rejected = false;
-
-  bool haveFifo = false;
-  size_t len = 0;
-  uint8_t local[96];
-
-  portENTER_CRITICAL(&eventMux);
-
-  if (creditEvent)
-  {
-    haveCredit = true;
-    credit = creditValue;
-    creditEvent = false;
-  }
-
-  if (creditRejected)
-  {
-    rejected = true;
-    creditRejected = false;
-  }
-
-  if (fifoEvent)
-  {
-    haveFifo = true;
-    len = fifoLength;
-    memcpy(local, fifoBuffer, len);
-    fifoEvent = false;
-  }
-
-  portEXIT_CRITICAL(&eventMux);
-
-  if (rejected)
-  {
-    showMessage(
-      "FRAMING ERROR",
-      "CREDIT=FF"
-    );
-  }
-
-  if (haveCredit)
-  {
-    totalCreditsRx += credit;
-    creditsForTx += credit;
-
-    showMessage(
-      "CREDIT RX OK",
-      String("Now:") + credit,
-      String("TX credits:") + creditsForTx,
-      counters(),
-      "Starting app test"
-    );
-
-    if (!testRunning)
-    {
-      testRunning = true;
-      delay(250);
-      runStep(1);
-    }
-  }
-
-  if (haveFifo)
-    handleFifo(local, len);
+  finalShown = false;
 }
 
 void cleanupClient()
 {
-  transportReady = false;
-  testRunning = false;
-  testStep = 0;
+  resetStates();
 
-  totalCreditsRx = 0;
-  totalFifoRx = 0;
-  creditsForTx = 0;
-
-  diagService = nullptr;
-  diagFifo = nullptr;
-  diagCredits = nullptr;
-
-  if (client != nullptr)
+  if (client)
   {
     if (client->isConnected())
       client->disconnect();
@@ -632,8 +553,143 @@ void startProbe()
 
   if (!findTacho()) return;
   if (!connectTacho()) return;
-  setupTransport();
+
+  showMessage(
+    "DUALPORT TEST",
+    "Setup DOWNLOAD..."
+  );
+
+  bool dlOk =
+    setupPort(
+      dl,
+      UUID_DL_SERVICE,
+      UUID_DL_FIFO,
+      UUID_DL_CREDITS,
+      dlFifoCb,
+      dlCreditCb,
+      "DL"
+    );
+
+  showMessage(
+    "DUALPORT TEST",
+    String("DOWNLOAD:") + (dlOk ? "OK" : "FAIL"),
+    "Setup DIAG..."
+  );
+
+  bool dgOk =
+    setupPort(
+      dg,
+      UUID_DG_SERVICE,
+      UUID_DG_FIFO,
+      UUID_DG_CREDITS,
+      dgFifoCb,
+      dgCreditCb,
+      "DG"
+    );
+
+  showMessage(
+    "DUALPORT READY",
+    String("DL:") + (dlOk ? "OK" : "FAIL"),
+    String("DG:") + (dgOk ? "OK" : "FAIL"),
+    "Waiting credits..."
+  );
+
+  testStartMs = millis();
 }
+
+// ============================================================
+// Event processing
+// ============================================================
+
+void processPortEvents(
+  PortState& p,
+  const char* label
+)
+{
+  bool haveCredit = false;
+  uint8_t credit = 0;
+  bool haveFifo = false;
+  size_t len = 0;
+  uint8_t local[96];
+
+  portENTER_CRITICAL(&mux);
+
+  if (p.creditEvent)
+  {
+    haveCredit = true;
+    credit = p.creditValue;
+    p.creditEvent = false;
+  }
+
+  if (p.fifoEvent)
+  {
+    haveFifo = true;
+    len = p.fifoLen;
+    memcpy(local, p.fifoBuf, len);
+    p.fifoEvent = false;
+  }
+
+  portEXIT_CRITICAL(&mux);
+
+  if (haveCredit)
+  {
+    p.creditsRx += credit;
+    p.txCredits += credit;
+
+    Serial.print(label);
+    Serial.print(" CREDIT RX=");
+    Serial.println(credit);
+
+    if (!p.startSent)
+    {
+      delay(100);
+      sendStartComm(p, label);
+    }
+  }
+
+  if (haveFifo)
+  {
+    p.fifoRx++;
+    grantCredits(p, 1);
+
+    Serial.print(label);
+    Serial.print(" FIFO RX: ");
+
+    for (size_t i = 0; i < len; ++i)
+    {
+      Serial.print(hexByte(local[i]));
+      Serial.print(" ");
+    }
+
+    Serial.println();
+
+    showMessage(
+      "FIFO RESPONSE!",
+      String(label) + " port",
+      String("Len:") + len,
+      rawLine(local, len, 0, 6),
+      rawLine(local, len, 6, 6)
+    );
+  }
+}
+
+void showFinal()
+{
+  finalShown = true;
+
+  showMessage(
+    "DUALPORT RESULT",
+    portLine("DL", dl),
+    portLine("DG", dg),
+    String("DLtx:") + (dl.startTxOk ? "OK" : "NO") +
+      " DGtx:" + (dg.startTxOk ? "OK" : "NO"),
+    "CONF=again"
+  );
+}
+
+// ============================================================
+// Setup / loop
+// ============================================================
 
 void setup()
 {
@@ -681,10 +737,10 @@ void setup()
   }
 
   showMessage(
-    "FRAMING PROBE",
-    "APP payload only",
-    "no K-line wrapper",
-    "FW .10"
+    "DUALPORT PROBE",
+    "DOWNLOAD vs DIAG",
+    "StartComm both",
+    "FW .11"
   );
 
   delay(1000);
@@ -710,46 +766,36 @@ void setup()
 
 void loop()
 {
-  processEvents();
+  processPortEvents(dl, "DL");
+  processPortEvents(dg, "DG");
 
   if (disconnected)
   {
     disconnected = false;
 
     showMessage(
-      "FRAMING ERROR",
+      "DUALPORT ERROR",
       "BLE DISCONNECT",
       String("Reason:") + disconnectReason,
       "BACK=retry"
     );
   }
 
-  if (testRunning &&
-      testStep > 0 &&
-      millis() - stepStartedMs > 1400)
+  if (!finalShown &&
+      millis() - testStartMs > 4500)
   {
-    if (testStep < 4)
-    {
-      delay(100);
-      runStep(testStep + 1);
-    }
-    else
-    {
-      runStep(5);
-    }
+    showFinal();
   }
 
   if (buttonPressed(PIN_CONFIRM))
   {
-    if (creditsForTx > 0)
-    {
-      testRunning = true;
-      runStep(1);
-    }
+    startProbe();
   }
 
   if (buttonPressed(PIN_BACK))
+  {
     startProbe();
+  }
 
   delay(2);
 }
