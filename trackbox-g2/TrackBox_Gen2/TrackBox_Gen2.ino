@@ -29,7 +29,7 @@
 // ============================================================
 
 static const char* TB_FW_VERSION =
-  "2026.10.22.11-DUALPORT";
+  "2026.10.22.12-NIMBLE240";
 
 // Arduino sketch preprocessor may generate function prototypes before
 // the full PortState definition. Forward-declare it explicitly.
