@@ -143,6 +143,9 @@ volatile int lastBleDisconnectReason = -1;
 volatile uint8_t lastBleDisconnectStage = ST_BOOT;
 volatile bool lastBleAuthCompleted = false;
 volatile bool lastBleEncrypted = false;
+volatile bool lastBleLinkEstablished = false;
+volatile int8_t lastBleSecurityResult = -1; // -1 not attempted, 0 failed, 1 success
+volatile int lastBleOperationError = -1;
 
 const char* bleStageName(uint8_t stage)
 {
@@ -388,7 +391,7 @@ static const char* OTA_HOSTNAME =
   "trackbox-g2";
 
 static const char* TB_FW_VERSION =
-  "2026.10.22.1";
+  "2026.10.22.2";
 
 static const char* OTA_VERSION_URL =
   "https://raw.githubusercontent.com/Rumcajs201/media/main/trackbox-g2/firmware/version.txt";
@@ -2302,7 +2305,10 @@ class TachoClientCallbacks
     );
 
     lastBleDisconnectReason = reason;
-    lastBleDisconnectStage = (uint8_t)state;
+    // Preserve the first failure stage when startEverything() already
+    // switched to ST_ERROR before this asynchronous callback fires.
+    if (state != ST_ERROR)
+      lastBleDisconnectStage = (uint8_t)state;
     disconnected = true;
   }
 
@@ -2547,14 +2553,21 @@ bool connectTachograph()
     "Connecting SE5000..."
   );
 
-  if (!client->connect(address))
+  // F912 and diagnostic control packets fit in default 23-byte ATT MTU.
+  // Avoid automatic MTU exchange before secureConnection on the SE5000.
+  if (!client->connect(address, true, false, false))
   {
+    lastBleOperationError = client->getLastError();
+    Serial.printf("CONNECT FAILED err=%d\n", lastBleOperationError);
+
     Serial.println(
       "CONNECT FAILED"
     );
 
     return false;
   }
+
+  lastBleLinkEstablished = true;
 
   Serial.println(
     "BLE CONNECT OK"
@@ -2583,6 +2596,12 @@ bool connectTachograph()
 
   bool secure =
     client->secureConnection();
+
+  lastBleSecurityResult = secure ? 1 : 0;
+  if (!secure)
+    lastBleOperationError = client->getLastError();
+  else if (client->isConnected())
+    lastBleEncrypted = client->getConnInfo().isEncrypted();
 
   Serial.print(
     "secureConnection: "
@@ -3259,6 +3278,9 @@ bool startEverything()
   lastBleDisconnectStage = ST_BOOT;
   lastBleAuthCompleted = false;
   lastBleEncrypted = false;
+  lastBleLinkEstablished = false;
+  lastBleSecurityResult = -1;
+  lastBleOperationError = -1;
 
   tachoCredits = 0;
 
@@ -3273,6 +3295,7 @@ bool startEverything()
 
   if (!findTachograph())
   {
+    lastBleDisconnectStage = (uint8_t)state;
     state = ST_ERROR;
 
     showMessage(
@@ -3288,6 +3311,7 @@ bool startEverything()
 
   if (!connectTachograph())
   {
+    lastBleDisconnectStage = (uint8_t)state;
     state = ST_ERROR;
 
     showMessage(
@@ -3303,6 +3327,7 @@ bool startEverything()
 
   if (!setupDiagnosticTransport())
   {
+    lastBleDisconnectStage = (uint8_t)state;
     state = ST_ERROR;
 
     showMessage(
@@ -3648,16 +3673,22 @@ void loop()
       (unsigned)lastBleDisconnectReason
     );
 
-    String authInfo =
-      String("Auth:") + (lastBleAuthCompleted ? "YES" : "NO") +
-      " Enc:" + (lastBleEncrypted ? "YES" : "NO");
+    String securityInfo =
+      String("Link:") + (lastBleLinkEstablished ? "Y" : "N") +
+      " Sec:" + (lastBleSecurityResult == 1 ? "OK" :
+                 lastBleSecurityResult == 0 ? "FAIL" : "N/A") +
+      " E:" + (lastBleEncrypted ? "Y" : "N");
+
+    String operationInfo =
+      String("OpErr:") + String(lastBleOperationError) +
+      " BACK=retry";
 
     showMessage(
       "TrackBox BLE ERROR",
       bleReason,
       String("Etap: ") + bleStageName(lastBleDisconnectStage),
-      authInfo,
-      "BACK=retry"
+      securityInfo,
+      operationInfo
     );
   }
 
