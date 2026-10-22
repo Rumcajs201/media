@@ -91,4 +91,19 @@ jobs:
 
           VERSION="$(cat trackbox-g2/firmware/version.txt)"
           git commit -m "TrackBox G2 firmware $VERSION [skip ci]"
-          git push
+
+          # The main branch can move while the ESP32 build is running.
+          # Replay our firmware publication commit on top of the latest main
+          # instead of failing with a non-fast-forward push.
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main
+            if git push origin HEAD:main; then
+              echo "Published TrackBox G2 firmware $VERSION"
+              exit 0
+            fi
+            echo "Concurrent update detected; retrying push ($attempt/5)"
+            sleep $((attempt * 2))
+          done
+          echo "Could not publish firmware after 5 attempts"
+          exit 1
