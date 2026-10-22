@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.22.6-PUREGOLDEN";
+  "2026.10.22.7-CLEARBOND";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -1838,6 +1838,39 @@ void setup()
   NimBLEDevice::init(
     LOCAL_NAME
   );
+
+
+  // CONTROLLED TEST: clear the ESP32-side NimBLE bond store.
+  // Removing TrackBox only from the tachograph does not remove
+  // the keys persisted by NimBLE in ESP32 NVS.
+  int bondsBefore =
+    NimBLEDevice::getNumBonds();
+
+  bool bondsCleared =
+    NimBLEDevice::deleteAllBonds();
+
+  showMessage(
+    "TrackBox BOND TEST",
+    String("ESP bonds: ") + bondsBefore,
+    bondsCleared ? "ESP bond: CLEAR" : "ESP bond: ERR",
+    "Usun TB w tacho",
+    "CONFIRM=start"
+  );
+
+  // Wait for a deliberate press after the user removes the
+  // TrackBox entry from the tachograph's paired-device list.
+  while (digitalRead(PIN_CONFIRM) == LOW)
+    delay(10);
+
+  while (digitalRead(PIN_CONFIRM) == HIGH)
+    delay(10);
+
+  delay(60);
+
+  while (digitalRead(PIN_CONFIRM) == LOW)
+    delay(10);
+
+  delay(200);
 
 
   NimBLEDevice::setMTU(
