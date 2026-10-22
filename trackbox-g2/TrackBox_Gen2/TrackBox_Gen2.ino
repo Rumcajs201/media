@@ -361,7 +361,7 @@ static const char* OTA_HOSTNAME =
   "trackbox-g2";
 
 static const char* TB_FW_VERSION =
-  "2026.10.22.4-GOLDEN";
+  "2026.10.22.5-GOLDEN3311";
 
 static const char* OTA_VERSION_URL =
   "https://raw.githubusercontent.com/Rumcajs201/media/main/trackbox-g2/firmware/version.txt";
