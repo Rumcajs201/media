@@ -137,6 +137,30 @@ enum State
 
 State state = ST_BOOT;
 
+// Snapshot from the BLE disconnect callback. Shown on OLED because
+// Serial Monitor is unavailable during truck-side tests.
+volatile int lastBleDisconnectReason = -1;
+volatile uint8_t lastBleDisconnectStage = ST_BOOT;
+volatile bool lastBleAuthCompleted = false;
+volatile bool lastBleEncrypted = false;
+
+const char* bleStageName(uint8_t stage)
+{
+  switch (stage)
+  {
+    case ST_SCAN: return "SCAN";
+    case ST_CONNECT: return "CONNECT";
+    case ST_SECURITY: return "SECURITY";
+    case ST_DIAG_SETUP: return "DIAG SETUP";
+    case ST_DIAG_READY: return "DIAG READY";
+    case ST_WAIT_ODOMETER: return "F912";
+    case ST_WAIT_STARTCOMM: return "STARTCOMM";
+    case ST_ODOMETER_OK: return "ODO OK";
+    case ST_ERROR: return "ERROR";
+    default: return "BOOT";
+  }
+}
+
 
 // ============================================================
 // TACHOGRAF
@@ -364,7 +388,7 @@ static const char* OTA_HOSTNAME =
   "trackbox-g2";
 
 static const char* TB_FW_VERSION =
-  "2026.10.21.2";
+  "2026.10.22.1";
 
 static const char* OTA_VERSION_URL =
   "https://raw.githubusercontent.com/Rumcajs201/media/main/trackbox-g2/firmware/version.txt";
@@ -2277,6 +2301,8 @@ class TachoClientCallbacks
       reason
     );
 
+    lastBleDisconnectReason = reason;
+    lastBleDisconnectStage = (uint8_t)state;
     disconnected = true;
   }
 
@@ -2337,8 +2363,11 @@ class TachoClientCallbacks
 
     Serial.print("Encrypted: ");
 
+    lastBleAuthCompleted = true;
+    lastBleEncrypted = connInfo.isEncrypted();
+
     Serial.println(
-      connInfo.isEncrypted()
+      lastBleEncrypted
       ? "YES"
       : "NO"
     );
@@ -2495,11 +2524,13 @@ bool connectTachograph()
     false
   );
 
+  // BLE supervision timeout: 600 * 10 ms = 6 seconds.
+  // Previous 200 (2 s) matched the observed 2-3 s disconnect window.
   client->setConnectionParams(
     12,
     24,
     0,
-    200
+    600
   );
 
   client->setConnectTimeout(
@@ -3223,6 +3254,12 @@ bool pressed(
 
 bool startEverything()
 {
+  disconnected = false;
+  lastBleDisconnectReason = -1;
+  lastBleDisconnectStage = ST_BOOT;
+  lastBleAuthCompleted = false;
+  lastBleEncrypted = false;
+
   tachoCredits = 0;
 
   transportConfigured = false;
@@ -3419,6 +3456,10 @@ void setup()
   // BLE
   // ========================================================
 
+  // Explicitly disable Wi-Fi on normal boot. OTA keeps its own
+  // service mode and saved network credentials remain untouched.
+  WiFi.mode(WIFI_OFF);
+
   Serial.println();
   Serial.println(
     "======================================"
@@ -3599,10 +3640,24 @@ void loop()
 
     state = ST_ERROR;
 
+    char bleReason[24];
+    snprintf(
+      bleReason, sizeof(bleReason),
+      "Reason:%d (0x%X)",
+      lastBleDisconnectReason,
+      (unsigned)lastBleDisconnectReason
+    );
+
+    String authInfo =
+      String("Auth:") + (lastBleAuthCompleted ? "YES" : "NO") +
+      " Enc:" + (lastBleEncrypted ? "YES" : "NO");
+
     showMessage(
-      "TrackBox G2",
-      "BLE rozlaczone",
-      "BACK=connect"
+      "TrackBox BLE ERROR",
+      bleReason,
+      String("Etap: ") + bleStageName(lastBleDisconnectStage),
+      authInfo,
+      "BACK=retry"
     );
   }
 
