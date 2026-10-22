@@ -31,6 +31,10 @@
 static const char* TB_FW_VERSION =
   "2026.10.22.11-DUALPORT";
 
+// Arduino sketch preprocessor may generate function prototypes before
+// the full PortState definition. Forward-declare it explicitly.
+struct PortState;
+
 #define PIN_CONFIRM   38
 #define PIN_SDA       39
 #define PIN_SCL       40
@@ -418,8 +422,8 @@ bool setupPort(
   const char* serviceUuid,
   const char* fifoUuid,
   const char* creditsUuid,
-  notify_callback fifoCb,
-  notify_callback creditCb,
+  NimBLERemoteCharacteristic::notify_callback fifoCb,
+  NimBLERemoteCharacteristic::notify_callback creditCb,
   const char* label
 )
 {
