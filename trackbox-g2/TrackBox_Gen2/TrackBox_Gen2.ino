@@ -391,7 +391,7 @@ static const char* OTA_HOSTNAME =
   "trackbox-g2";
 
 static const char* TB_FW_VERSION =
-  "2026.10.22.2";
+  "2026.10.22.3";
 
 static const char* OTA_VERSION_URL =
   "https://raw.githubusercontent.com/Rumcajs201/media/main/trackbox-g2/firmware/version.txt";
@@ -2530,13 +2530,13 @@ bool connectTachograph()
     false
   );
 
-  // BLE supervision timeout: 600 * 10 ms = 6 seconds.
-  // Previous 200 (2 s) matched the observed 2-3 s disconnect window.
+  // Restore the exact connection parameters from the proven F912 baseline.
+  // Keep diagnostics around the connection, but do not alter the BLE timing.
   client->setConnectionParams(
     12,
     24,
     0,
-    600
+    200
   );
 
   client->setConnectTimeout(
@@ -2553,9 +2553,9 @@ bool connectTachograph()
     "Connecting SE5000..."
   );
 
-  // F912 and diagnostic control packets fit in default 23-byte ATT MTU.
-  // Avoid automatic MTU exchange before secureConnection on the SE5000.
-  if (!client->connect(address, true, false, false))
+  // Restore the proven baseline connect path.
+  // NimBLE 2.x default connect performs the MTU exchange automatically.
+  if (!client->connect(address))
   {
     lastBleOperationError = client->getLastError();
     Serial.printf("CONNECT FAILED err=%d\n", lastBleOperationError);
