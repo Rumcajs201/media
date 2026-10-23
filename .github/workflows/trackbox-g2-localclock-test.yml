@@ -1,0 +1,70 @@
+name: Build TrackBox G2 local clock prototype
+
+on:
+  push:
+    branches:
+      - prototype/trackbox-g2-clock-23-11
+    paths:
+      - "trackbox-g2/TrackBox_Gen2/**"
+      - ".github/workflows/trackbox-g2-localclock-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compile-prototype:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout experimental branch
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.7 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+      - name: Install display and BLE libraries
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "U8g2"
+          arduino-cli lib install "NimBLE-Arduino@2.5.1"
+
+      - name: Compile ESP32-S3 sketch
+        run: |
+          mkdir -p build
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" \
+            --output-dir build \
+            trackbox-g2/TrackBox_Gen2
+
+      - name: Save prototype BIN (never replace latest.bin)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p trackbox-g2/prototype
+          APP_BIN="$(find build -maxdepth 1 -type f -name '*.bin' ! -name '*bootloader*' ! -name '*partitions*' ! -name '*merged*' ! -name 'boot_app0.bin' | head -n 1)"
+          test -n "$APP_BIN"
+          cp "$APP_BIN" trackbox-g2/prototype/TrackBox_G2_23.11_LOCALCLOCK_TEST.bin
+          sha256sum trackbox-g2/prototype/TrackBox_G2_23.11_LOCALCLOCK_TEST.bin | awk '{print $1}' > trackbox-g2/prototype/TrackBox_G2_23.11_LOCALCLOCK_TEST.sha256
+          printf '%s\n' "2026.10.23.11-LOCALCLOCK-TEST" > trackbox-g2/prototype/version.txt
+
+      - name: Upload compiled prototype artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackBox_G2_23_11_LOCALCLOCK_TEST
+          path: trackbox-g2/prototype/
+          retention-days: 30
+
+      - name: Publish only to experimental branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "TrackBox Prototype Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add trackbox-g2/prototype
+          git commit -m "TrackBox G2 23.11 compiled prototype [skip ci]"
+          git push origin HEAD:prototype/trackbox-g2-clock-23-11
