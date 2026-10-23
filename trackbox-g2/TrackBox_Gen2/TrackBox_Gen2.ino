@@ -3,10 +3,13 @@
 #include <U8g2lib.h>
 #include <NimBLEDevice.h>
 #include <esp_ota_ops.h>
+#include <sys/time.h>
+#include <time.h>
+#include <stdlib.h>
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.10-BLESCANPAIR";
+  "2026.10.23.11-LOCALCLOCK-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -131,6 +134,7 @@ enum State
   ST_WAIT_STARTCOMM,
   ST_ODOMETER_OK,
   ST_WAIT_SPEED,
+  ST_WAIT_TIME,
   ST_ERROR
 };
 
@@ -214,6 +218,16 @@ float speedKmh = 0.0f;
 uint32_t speedLastOkMs = 0;
 uint32_t nextSpeedRequestAt = 0;
 uint32_t speedReplies = 0;
+
+// F90B TimeDate is queried independently, only when F902/F912 are idle.
+// RTC holds local time while power remains on; no Wi-Fi is used in run mode.
+static const uint32_t TIME_SYNC_PERIOD_MS = 3600000UL;
+static const uint32_t TIME_RETRY_MS = 600000UL;
+static const uint32_t TIME_TIMEOUT_MS = 1800UL;
+bool clockValid = false;
+uint32_t nextTimeSyncAtMs = 0;
+char clockText[6] = "--:--";
+int32_t clockMinuteStamp = -1;
 
 // OLED-only overspeed timer: starts above 90 km/h, resets at <= 90 km/h.
 // Uses real elapsed milliseconds rather than counting F902 responses.
@@ -392,6 +406,107 @@ void showOdometer()
   oled.sendBuffer();
 }
 
+// ============================================================
+// TACHOGRAPH CLOCK: F90B is 8 bytes per EU 2016/799, Table 40.
+// Fields: quarter-seconds, minutes, hours, month, quarter-days,
+// years since 1985, local minute/hour offsets. Time is UTC.
+// Convert UTC to Norway's local time using automatic CET/CEST.
+// ============================================================
+
+static bool isLeapYear(int year)
+{
+  return (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
+}
+
+static uint8_t daysInMonth(int year, uint8_t month)
+{
+  static const uint8_t days[] =
+    {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (month < 1 || month > 12) return 0;
+  return (month == 2 && isLeapYear(year)) ? 29 : days[month - 1];
+}
+
+// UTC Gregorian date -> Unix days (independent of host TZ).
+static int64_t unixDaysFromCivil(int y, unsigned m, unsigned d)
+{
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static bool refreshClockText()
+{
+  if (!clockValid) return false;
+
+  const time_t utcNow = time(nullptr);
+  struct tm localNow;
+  if (localtime_r(&utcNow, &localNow) == nullptr) return false;
+
+  const int32_t minuteStamp =
+    (int32_t)localNow.tm_year * 527040L +
+    (int32_t)localNow.tm_yday * 1440L +
+    localNow.tm_hour * 60 + localNow.tm_min;
+
+  if (minuteStamp == clockMinuteStamp) return false;
+  clockMinuteStamp = minuteStamp;
+  snprintf(clockText, sizeof(clockText), "%02d:%02d",
+           localNow.tm_hour, localNow.tm_min);
+  return true;
+}
+
+static void timeSyncFailed(const char* reason, bool unsupported = false)
+{
+  Serial.printf("F90B sync skipped: %s\n", reason);
+  state = ST_ODOMETER_OK;
+  nextTimeSyncAtMs = millis() +
+    (unsupported ? TIME_SYNC_PERIOD_MS : TIME_RETRY_MS);
+  // Keep any previously synchronized clock running; never invent a time.
+}
+
+static void handleTimeDateF90B(const uint8_t* bytes)
+{
+  if (state != ST_WAIT_TIME) return;
+
+  const unsigned sec = bytes[0] / 4U;
+  const unsigned minute = bytes[1];
+  const unsigned hour = bytes[2];
+  const unsigned month = bytes[3];
+  const unsigned day = bytes[4] / 4U;
+  const int year = 1985 + bytes[5];
+
+  if (year < 2020 || year > 2100 || sec >= 60 || minute >= 60 ||
+      hour >= 24 || month < 1 || month > 12 || day < 1 ||
+      day > daysInMonth(year, month))
+  {
+    timeSyncFailed("invalid TimeDate fields");
+    return;
+  }
+
+  const int64_t epoch =
+    unixDaysFromCivil(year, month, day) * 86400LL +
+    hour * 3600LL + minute * 60LL + sec;
+  struct timeval tv;
+  tv.tv_sec = (time_t)epoch;
+  tv.tv_usec = (suseconds_t)(bytes[0] % 4U) * 250000;
+
+  if (settimeofday(&tv, nullptr) != 0)
+  {
+    timeSyncFailed("settimeofday failed");
+    return;
+  }
+
+  clockValid = true;
+  clockMinuteStamp = -1;
+  nextTimeSyncAtMs = millis() + TIME_SYNC_PERIOD_MS;
+  state = ST_ODOMETER_OK;
+  Serial.printf("F90B UTC: %04d-%02u-%02u %02u:%02u:%02u\n",
+                year, month, day, hour, minute, sec);
+  showSpeedAndOdometer();
+}
+
 // Overspeed display: only a large elapsed-seconds counter on the SH1106.
 // The digits are centered, and we redraw only when the second changes.
 void showOverspeedSeconds()
@@ -427,8 +542,8 @@ void showOverspeedSeconds()
   oled.sendBuffer();
 }
 
-// Draw either overspeed seconds or the normal odometer/speed screen.
-// Full-buffer send avoids explicit visible clears/flicker.
+// Large speed; odometer and HH:MM below. Diagnostic strings remain
+// available on errors/Serial but are hidden in the driving view.
 void showSpeedAndOdometer()
 {
   if (overspeedActive)
@@ -437,45 +552,40 @@ void showSpeedAndOdometer()
     return;
   }
 
-  drawHeader("TrackBox G2 F902");
+  refreshClockText();
+  oled.clearBuffer();
+
+  char speedText[16];
+  if (speedValid && (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS)
+    snprintf(speedText, sizeof(speedText), "%.1f", speedKmh);
+  else
+    snprintf(speedText, sizeof(speedText), "--.-");
+
+  oled.setFont(u8g2_font_logisoso32_tn);
+  if (oled.getStrWidth(speedText) > 94)
+    oled.setFont(u8g2_font_logisoso24_tn);
+  if (oled.getStrWidth(speedText) > 94)
+    oled.setFont(u8g2_font_7x14B_tf);
+
+  oled.drawStr(0, 34, speedText);
   oled.setFont(u8g2_font_6x10_tf);
-  oled.setCursor(0, 25);
-  oled.print("ODO ");
-  oled.print(odometerKm, 1);
+  oled.drawStr(99, 34, "km/h");
+  oled.drawHLine(0, 37, 128);
+
+  // Existing F912 conversion/precision retained.
+  oled.setCursor(0, 49);
+  if (hasOdometer)
+    oled.print(odometerKm, 1);
+  else
+    oled.print("------.-");
   oled.print(" km");
 
+  // The cached text changes only on a minute boundary.
   oled.setFont(u8g2_font_7x14B_tf);
-  oled.setCursor(0, 46);
-  if (speedValid && (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS)
-    oled.print(speedKmh, 1);
-  else
-    oled.print("--.-");
-
-  oled.setFont(u8g2_font_6x10_tf);
-  oled.setCursor(78, 44);
-  oled.print("km/h");
-  oled.setCursor(0, 60);
-  if (speedLastNrc)
-  {
-    oled.print("F902 NRC 0x");
-    if (speedLastNrc < 16) oled.print('0');
-    oled.print(speedLastNrc, HEX);
-  }
-  else if (speedPayloadInvalid)
-    oled.print("F902 invalid");
-  else if (speedTimedOut)
-    oled.print("F902 T/O auto 3s");
-  else if (speedStaleDrawn)
-    oled.print("F902 stale");
-  else if (speedReplies > 0)
-  {
-    oled.print("F902 OK #");
-    oled.print(speedReplies);
-  }
-  else
-    oled.print("F902 waiting...");
+  oled.drawStr(90, 63, clockText);
   oled.sendBuffer();
 }
+
 
 void onOdometerReadOk()
 {
@@ -493,6 +603,7 @@ void onOdometerReadOk()
     speedPayloadInvalid = false;
     speedStaleDrawn = false;
     nextSpeedRequestAt = millis() + SPEED_POLL_MS;
+    nextTimeSyncAtMs = millis() + 5000UL;
   }
 
   showSpeedAndOdometer();
@@ -819,6 +930,27 @@ bool sendSpeedRequest()
   state = ST_WAIT_SPEED;
   requestStartMs = millis();
   Serial.println("F902 request sent");
+  return true;
+}
+
+// Separate F90B request. Never overlap F902/F912 requests.
+bool sendTimeRequest()
+{
+  if (!hasOdometer || state != ST_ODOMETER_OK || tachoCredits <= 0)
+    return false;
+
+  uint8_t msg[8] = {0x80, VU_ADDRESS, TESTER_ADDRESS,
+                    0x03, SID_READ_DATA, 0xF9, 0x0B, 0};
+  msg[7] = kwpChecksum(msg, 7);
+  if (!sendDiagPacket(msg, sizeof(msg)))
+  {
+    Serial.println("F90B TX failed; retry later");
+    nextTimeSyncAtMs = millis() + TIME_RETRY_MS;
+    return false;
+  }
+  state = ST_WAIT_TIME;
+  requestStartMs = millis();
+  Serial.println("F90B TimeDate request sent");
   return true;
 }
 
@@ -1472,11 +1604,25 @@ void handleKwpFrame(
   }
 
 
+  // RAW UDS positive: 62 F9 0B [8-byte TimeDate].
+  if (length >= 11 && data[0] == SID_READ_DATA_POS &&
+      data[1] == 0xF9 && data[2] == 0x0B)
+  {
+    handleTimeDateF90B(data + 3);
+    return;
+  }
+
   // RAW UDS positive: 62 F9 02 HI LO
   if (length >= 5 && data[0] == SID_READ_DATA_POS &&
       data[1] == 0xF9 && data[2] == 0x02)
   {
     handleSpeedBytes(data[3], data[4]);
+    return;
+  }
+  if (length >= 3 && state == ST_WAIT_TIME &&
+      data[0] == SID_NEGATIVE && data[1] == SID_READ_DATA)
+  {
+    timeSyncFailed("negative response", true);
     return;
   }
   // RAW UDS negative: 7F 22 NRC
@@ -1541,6 +1687,14 @@ void handleKwpFrame(
 
 
   uint8_t sid = data[4];
+
+  // Positive F90B KWP: 80 tgt src 0B 62 F9 0B [8 bytes] CS.
+  if (sid == SID_READ_DATA_POS && length >= 16 &&
+      data[5] == 0xF9 && data[6] == 0x0B)
+  {
+    handleTimeDateF90B(data + 7);
+    return;
+  }
 
   // Positive F902 KWP: 80 tgt src 05 62 F9 02 HI LO CS.
   if (sid == SID_READ_DATA_POS && length >= 10 &&
@@ -1699,6 +1853,13 @@ void handleKwpFrame(
       nrc
     );
 
+
+    // F90B is optional; if unsupported, do not disturb F902 or F912.
+    if (state == ST_WAIT_TIME)
+    {
+      timeSyncFailed("tachograph refused F90B", true);
+      return;
+    }
 
     // Ignore negative response to a background F912 request,
     // keep the existing odometer and uninterrupted speed polling.
@@ -1998,6 +2159,7 @@ bool startEverything()
   overspeedLastShownSec = 0xFFFFFFFFUL;
   periodicOdoInFlight = false;
   nextOdoRequestAt = 0;
+  nextTimeSyncAtMs = 0;
 
   tachoCredits = 0;
 
@@ -2164,6 +2326,10 @@ void setup()
 
   oled.begin();
 
+  // Norway: standard time UTC+1, daylight-saving time UTC+2.
+  // No network is needed for the timezone conversion.
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+  tzset();
 
   // Minimal recovery path only. Holding encoder PUSH during RESET
   // switches back to the previous OTA-capable app partition.
@@ -2203,8 +2369,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "BLEPAIR 23.10",
-    "SCAN + BOND FIX",
+    "LOCALCLOCK 23.11",
+    "F90B CLOCK TEST",
     "BLE ONLY"
   );
   delay(1200);
@@ -2362,6 +2528,27 @@ void loop()
                   (unsigned long)speedRetryAttempts);
     sendSpeedRequest();
   }
+
+  // Clock requests are optional and run between F912 and F902 polling.
+  // A failure affects only the clock; never the established data session.
+  if (hasOdometer && state == ST_ODOMETER_OK &&
+      nextTimeSyncAtMs != 0 &&
+      !manualOdoPending && tachoCredits > 0 &&
+      (int32_t)(millis() - nextTimeSyncAtMs) >= 0)
+  {
+    sendTimeRequest();
+  }
+
+  if (state == ST_WAIT_TIME &&
+      (uint32_t)(millis() - requestStartMs) > TIME_TIMEOUT_MS)
+  {
+    timeSyncFailed("timeout waiting for F90B");
+  }
+
+  // Update the clock only when local HH:MM changes; speed redraws may
+  // still refresh the shared OLED buffer every speed sample.
+  if (!overspeedActive && hasOdometer && refreshClockText())
+    showSpeedAndOdometer();
 
   // Service a due odometer request ahead of the next speed query.
   // One diagnostic request in flight at any time.
