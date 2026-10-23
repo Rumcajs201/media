@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.9-BLESCANFIX";
+  "2026.10.23.10-BLESCANPAIR";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -148,6 +148,7 @@ uint8_t tachoAddressType = 0;
 
 // Scan diagnostics and explicit ESP bond-reset availability.
 bool scanNotFound = false;
+bool blePairingFailed = false;
 uint32_t lastScanElapsedMs = 0;
 uint32_t lastScanDevices = 0;
 uint8_t lastScanRounds = 0;
@@ -2002,6 +2003,7 @@ bool startEverything()
 
   transportConfigured = false;
   scanNotFound = false;
+  blePairingFailed = false;
   lastScanElapsedMs = 0;
   lastScanDevices = 0;
   lastScanRounds = 0;
@@ -2031,14 +2033,15 @@ bool startEverything()
   if (!connectTachograph())
   {
     state = ST_ERROR;
+    blePairingFailed = true;
 
     showMessage(
       "TrackBox G2",
       "BLE / Security",
       "FAILED",
+      "CONF=clear bonds",
       "BACK=retry"
     );
-
     return false;
   }
 
@@ -2200,8 +2203,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "BLESCAN 23.9",
-    "SCAN + PAIR FIX",
+    "BLEPAIR 23.10",
+    "SCAN + BOND FIX",
     "BLE ONLY"
   );
   delay(1200);
@@ -2552,7 +2555,7 @@ void loop()
   {
     // The tachograph erased pairing; ESP32 may retain old keys.
     // Never erase silently: CONFIRM does it only on scan failure.
-    if (state == ST_ERROR && scanNotFound)
+    if (state == ST_ERROR && (scanNotFound || blePairingFailed))
     {
       bool ok = NimBLEDevice::deleteAllBonds();
       Serial.printf("ESP bonds erased: %s\n", ok ? "YES" : "NO");
