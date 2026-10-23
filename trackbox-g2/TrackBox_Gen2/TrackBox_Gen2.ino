@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.2-F912BASE";
+  "2026.10.23.3-RXTRACE";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -217,6 +217,17 @@ volatile bool passkeyShown = false;
 volatile uint32_t pairingPasskey = 0;
 
 volatile bool passkeyEntryRequested = false;
+
+// Instrumentacja RX: tylko liczniki i OLED przy bledzie.
+// Bez zmian w ramkach, subskrypcjach i sekwencji F912.
+volatile uint32_t traceFifoCb = 0;
+volatile uint32_t traceCreditCb = 0;
+uint32_t traceParseCount = 0;
+uint32_t traceBadChecksum = 0;
+uint32_t traceF912TxOk = 0;
+uint32_t traceStartTxOk = 0;
+bool traceSecureOk = false;
+
 
 
 // ============================================================
@@ -520,6 +531,7 @@ bool sendOdometerRequest()
   if (!sendDiagPacket(msg, sizeof(msg)))
     return false;
 
+  traceF912TxOk++;
   state = ST_WAIT_ODOMETER;
 
   requestStartMs = millis();
@@ -563,6 +575,7 @@ bool sendStartCommunication()
   if (!sendDiagPacket(msg, sizeof(msg)))
     return false;
 
+  traceStartTxOk++;
   state = ST_WAIT_STARTCOMM;
 
   requestStartMs = millis();
@@ -596,6 +609,7 @@ void fifoCallback(
 
   portENTER_CRITICAL(&rxMux);
 
+  traceFifoCb++;
   memcpy(
     rxBuffer,
     data,
@@ -631,6 +645,7 @@ void creditCallback(
 
   portENTER_CRITICAL(&creditMux);
 
+  traceCreditCb++;
   if (data[0] == 0xFF)
   {
     creditRejected = true;
@@ -947,6 +962,7 @@ bool connectTachograph()
 
   bool secure =
     client->secureConnection();
+  traceSecureOk = secure;
 
   Serial.print(
     "secureConnection: "
@@ -1134,6 +1150,7 @@ void handleKwpFrame(
   size_t length
 )
 {
+  traceParseCount++;
   Serial.println();
 
   printHex(
@@ -1192,6 +1209,7 @@ void handleKwpFrame(
 
   if (!checkKwpChecksum(data, length))
   {
+    traceBadChecksum++;
     Serial.println(
       "WARNING: checksum incorrect"
     );
@@ -1617,6 +1635,19 @@ bool pressed(
 
 bool startEverything()
 {
+  // Jedna proba polaczenia = jeden zestaw licznikow.
+  portENTER_CRITICAL(&rxMux);
+  traceFifoCb = 0;
+  portEXIT_CRITICAL(&rxMux);
+  portENTER_CRITICAL(&creditMux);
+  traceCreditCb = 0;
+  portEXIT_CRITICAL(&creditMux);
+  traceParseCount = 0;
+  traceBadChecksum = 0;
+  traceF912TxOk = 0;
+  traceStartTxOk = 0;
+  traceSecureOk = false;
+
   tachoCredits = 0;
 
   transportConfigured = false;
@@ -1815,7 +1846,7 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "BASE 23.2",
+    "RXTRACE 23.3",
     "Oryginalny odczyt",
     "BLE ONLY"
   );
@@ -1988,11 +2019,28 @@ void loop()
   {
     state = ST_ERROR;
 
+    uint32_t fifoCount = 0;
+    uint32_t creditCount = 0;
+    portENTER_CRITICAL(&rxMux);
+    fifoCount = traceFifoCb;
+    portEXIT_CRITICAL(&rxMux);
+    portENTER_CRITICAL(&creditMux);
+    creditCount = traceCreditCb;
+    portEXIT_CRITICAL(&creditMux);
+
     showMessage(
-      "TrackBox G2 ERROR",
-      "StartComm timeout",
-      "brak odpowiedzi",
-      "CONFIRM=retry"
+      "TrackBox RX TRACE",
+      "StartComm TIMEOUT",
+      String("CR:") + creditCount +
+        " FIFO:" + fifoCount +
+        " P:" + traceParseCount,
+      String("TX:") + traceF912TxOk +
+        "/" + traceStartTxOk +
+        " C:" + tachoCredits,
+      String("BLE:") +
+        ((client && client->isConnected()) ? "1" : "0") +
+        " SEC:" + (traceSecureOk ? "1" : "0") +
+        " CS:" + traceBadChecksum
     );
 
     Serial.println(
