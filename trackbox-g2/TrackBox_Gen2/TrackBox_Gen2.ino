@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.8-OVERSPEED90";
+  "2026.10.23.9-BLESCANFIX";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -145,6 +145,12 @@ String tachoName = "";
 String tachoAddress = "";
 
 uint8_t tachoAddressType = 0;
+
+// Scan diagnostics and explicit ESP bond-reset availability.
+bool scanNotFound = false;
+uint32_t lastScanElapsedMs = 0;
+uint32_t lastScanDevices = 0;
+uint8_t lastScanRounds = 0;
 
 volatile int tachoCredits = 0;
 
@@ -1035,106 +1041,109 @@ TachoClientCallbacks clientCallbacks;
 bool findTachograph()
 {
   state = ST_SCAN;
+  scanNotFound = false;
+  lastScanDevices = 0;
+  lastScanElapsedMs = 0;
+  lastScanRounds = 0;
+  tachoName = "";
+  tachoAddress = "";
 
-  showMessage(
-    "TrackBox G2",
-    "Szukam SE5000...",
-    "BLE scan"
-  );
-
-  Serial.println();
-  Serial.println(
-    "=== SCAN SE5000 ==="
-  );
-
-  NimBLEScan* scan =
-    NimBLEDevice::getScan();
-
-  scan->stop();
-
-  scan->clearResults();
-
-  scan->setActiveScan(true);
-
-  scan->setInterval(100);
-
-  scan->setWindow(90);
-
-  scan->setMaxResults(40);
-
-  NimBLEScanResults results =
-    scan->getResults(
-      8000,
-      false
-    );
-
-  Serial.printf(
-    "Found BLE devices: %d\n",
-    results.getCount()
-  );
-
-  for (int i = 0;
-       i < results.getCount();
-       i++)
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  if (!scan)
   {
-    const NimBLEAdvertisedDevice* dev =
-      results.getDevice(i);
-
-    if (dev == nullptr)
-      continue;
-
-    String name = "";
-
-    if (dev->haveName())
-      name =
-        String(
-          dev->getName().c_str()
-        );
-
-    Serial.printf(
-      "[%d] %s  %s  RSSI=%d\n",
-      i,
-      name.length()
-        ? name.c_str()
-        : "(no name)",
-      dev->getAddress()
-        .toString()
-        .c_str(),
-      dev->getRSSI()
-    );
-
-    if (name.startsWith(TACHO_PREFIX))
-    {
-      tachoName = name;
-
-      tachoAddress =
-        String(
-          dev->getAddress()
-            .toString()
-            .c_str()
-        );
-
-      tachoAddressType =
-        dev->getAddressType();
-
-      Serial.println();
-      Serial.println(
-        "*** SE5000 FOUND ***"
-      );
-
-      Serial.print("Name: ");
-      Serial.println(tachoName);
-
-      Serial.print("Address: ");
-      Serial.println(tachoAddress);
-
-      return true;
-    }
+    Serial.println("BLE scan NULL");
+    scanNotFound = true;
+    return false;
   }
 
+  scan->stop();
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(90);
+  scan->setMaxResults(80);
+  scan->setDuplicateFilter(0);
+
+  const NimBLEUUID downloadUuid(UUID_DOWNLOAD_SERVICE);
+  const NimBLEUUID diagUuid(UUID_DIAG_SERVICE);
+
+  for (uint8_t round = 1; round <= 3; ++round)
+  {
+    lastScanRounds = round;
+    showMessage(
+      "TrackBox BLE SCAN",
+      String("Proba ") + round + "/3",
+      "Szukam SE5000...",
+      "Pairing w tacho"
+    );
+
+    scan->stop();
+    scan->clearResults();
+    uint32_t started = millis();
+    NimBLEScanResults found = scan->getResults(8000, false);
+    uint32_t elapsed = (uint32_t)(millis() - started);
+    lastScanElapsedMs += elapsed;
+    lastScanDevices += found.getCount();
+    Serial.printf("SCAN %u/3: %d devices, %lu ms\n",
+                  round, found.getCount(), (unsigned long)elapsed);
+
+    String uuidAddr = "";
+    String uuidName = "";
+    uint8_t uuidType = 0;
+    int uuidRssi = -128;
+    for (int k = 0; k < found.getCount(); ++k)
+    {
+      const NimBLEAdvertisedDevice* d = found.getDevice(k);
+      if (!d) continue;
+      String name = d->haveName() ? String(d->getName().c_str()) : String("");
+      String upper = name;
+      upper.toUpperCase();
+      bool byName = upper.indexOf("SE5000") >= 0;
+      bool byService = d->isAdvertisingService(downloadUuid) ||
+                       d->isAdvertisingService(diagUuid);
+      Serial.printf("BLE %d name='%s' addr=%s RSSI=%d service=%d\n",
+                    k, name.c_str(), d->getAddress().toString().c_str(),
+                    d->getRSSI(), byService);
+
+      if (byName)
+      {
+        tachoName = name;
+        tachoAddress = String(d->getAddress().toString().c_str());
+        tachoAddressType = d->getAddressType();
+        Serial.printf("SE5000 FOUND by NAME: %s\n", tachoAddress.c_str());
+        return true;
+      }
+      if (byService && d->isConnectable() && d->getRSSI() > uuidRssi)
+      {
+        uuidAddr = String(d->getAddress().toString().c_str());
+        uuidName = name.length() ? name : "SE5000 UUID";
+        uuidType = d->getAddressType();
+        uuidRssi = d->getRSSI();
+      }
+    }
+    if (uuidAddr.length())
+    {
+      tachoName = uuidName;
+      tachoAddress = uuidAddr;
+      tachoAddressType = uuidType;
+      Serial.printf("SE5000 FOUND by UUID: %s\n", tachoAddress.c_str());
+      return true;
+    }
+
+    showMessage(
+      "TrackBox BLE SCAN",
+      String("Proba ") + round + "/3 BRAK",
+      String("BLE: ") + found.getCount(),
+      String("Czas: ") + elapsed + "ms",
+      "Ponawiam..."
+    );
+    delay(400);
+  }
+  scanNotFound = true;
+  Serial.printf("SE5000 NOT FOUND: scans=%u devices=%lu elapsed=%lu ms\n",
+                lastScanRounds, (unsigned long)lastScanDevices,
+                (unsigned long)lastScanElapsedMs);
   return false;
 }
-
 
 // ============================================================
 // CONNECT
@@ -1992,6 +2001,10 @@ bool startEverything()
   tachoCredits = 0;
 
   transportConfigured = false;
+  scanNotFound = false;
+  lastScanElapsedMs = 0;
+  lastScanDevices = 0;
+  lastScanRounds = 0;
 
   firstReadSent = false;
 
@@ -2003,14 +2016,14 @@ bool startEverything()
   if (!findTachograph())
   {
     state = ST_ERROR;
-
     showMessage(
-      "TrackBox G2",
-      "SE5000",
-      "NIE ZNALEZIONY",
+      "SE5000 NIE ZNAL.",
+      String("Skan ") + lastScanRounds +
+        "/3: " + (lastScanElapsedMs / 1000) + "s",
+      String("BLE dev: ") + lastScanDevices,
+      "CONF=clear bonds",
       "BACK=retry"
     );
-
     return false;
   }
 
@@ -2187,8 +2200,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "OVERSPEED 23.8",
-    "90+ SECONDS",
+    "BLESCAN 23.9",
+    "SCAN + PAIR FIX",
     "BLE ONLY"
   );
   delay(1200);
@@ -2537,7 +2550,21 @@ void loop()
         lastConfirm,
         confirmChangeMs))
   {
-    if ((state == ST_DIAG_READY ||
+    // The tachograph erased pairing; ESP32 may retain old keys.
+    // Never erase silently: CONFIRM does it only on scan failure.
+    if (state == ST_ERROR && scanNotFound)
+    {
+      bool ok = NimBLEDevice::deleteAllBonds();
+      Serial.printf("ESP bonds erased: %s\n", ok ? "YES" : "NO");
+      showMessage(
+        "TrackBox BLE RESET",
+        ok ? "Bonds cleared" : "Bonds failure",
+        "Ponowny skan..."
+      );
+      delay(600);
+      restartConnection();
+    }
+    else if ((state == ST_DIAG_READY ||
          state == ST_ODOMETER_OK ||
          state == ST_WAIT_SPEED ||
          state == ST_ERROR) &&
