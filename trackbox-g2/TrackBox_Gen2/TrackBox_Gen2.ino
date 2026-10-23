@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.7-F902RETRY3S";
+  "2026.10.23.8-OVERSPEED90";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -208,6 +208,14 @@ uint32_t speedLastOkMs = 0;
 uint32_t nextSpeedRequestAt = 0;
 uint32_t speedReplies = 0;
 
+// OLED-only overspeed timer: starts above 90 km/h, resets at <= 90 km/h.
+// Uses real elapsed milliseconds rather than counting F902 responses.
+// No extra tachograph queries, LEDs, buzzer, Wi-Fi or BLE changes.
+static const uint16_t OVERSPEED_LIMIT_RAW = 90U * 256U;
+bool overspeedActive = false;
+uint32_t overspeedStartedAtMs = 0;
+uint32_t overspeedLastShownSec = 0xFFFFFFFFUL;
+
 
 // ============================================================
 // BLE RX FIFO
@@ -377,10 +385,51 @@ void showOdometer()
   oled.sendBuffer();
 }
 
-// Draw both odometer and instantaneous speed on 128x64 SH1106.
+// Overspeed display: only a large elapsed-seconds counter on the SH1106.
+// The digits are centered, and we redraw only when the second changes.
+void showOverspeedSeconds()
+{
+  if (!overspeedActive)
+    return;
+
+  const uint32_t elapsedSeconds =
+    (uint32_t)(millis() - overspeedStartedAtMs) / 1000UL;
+
+  if (elapsedSeconds == overspeedLastShownSec)
+    return;
+
+  overspeedLastShownSec = elapsedSeconds;
+
+  char digits[16];
+  if (elapsedSeconds < 100UL)
+    snprintf(digits, sizeof(digits), "%02lu", (unsigned long)elapsedSeconds);
+  else
+    snprintf(digits, sizeof(digits), "%lu", (unsigned long)elapsedSeconds);
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_logisoso42_tn);
+  if (oled.getStrWidth(digits) > 124)
+    oled.setFont(u8g2_font_logisoso32_tn);
+  if (oled.getStrWidth(digits) > 124)
+    oled.setFont(u8g2_font_logisoso24_tn);
+
+  const int16_t width = oled.getStrWidth(digits);
+  const int16_t x = (128 - width) / 2;
+  const int16_t y = (64 + oled.getAscent() + oled.getDescent()) / 2;
+  oled.drawStr(x > 0 ? x : 0, y, digits);
+  oled.sendBuffer();
+}
+
+// Draw either overspeed seconds or the normal odometer/speed screen.
 // Full-buffer send avoids explicit visible clears/flicker.
 void showSpeedAndOdometer()
 {
+  if (overspeedActive)
+  {
+    showOverspeedSeconds();
+    return;
+  }
+
   drawHeader("TrackBox G2 F902");
   oled.setFont(u8g2_font_6x10_tf);
   oled.setCursor(0, 25);
@@ -445,6 +494,11 @@ void onOdometerReadOk()
 void speedReadFailed(uint8_t nrc, bool timeout, bool invalid)
 {
   speedPollingEnabled = false;
+  // Stop counting on lost/invalid F902: we cannot assert >90 km/h
+  // without a current speed measurement. Resume with a new timer
+  // only when a later valid F902 reading again exceeds 90 km/h.
+  overspeedActive = false;
+  overspeedLastShownSec = 0xFFFFFFFFUL;
   // Only an actual timeout/temporary TX error is retried automatically.
   // Tachograph NRC (e.g. lack of ITS consent) or invalid values must NOT
   // be retried in a tight loop. F912 continues independently.
@@ -483,6 +537,25 @@ void handleSpeedBytes(uint8_t msb, uint8_t lsb)
   speedKmh = raw / 256.0f;
   speedLastOkMs = millis();
   speedValid = true;
+
+  // Only a valid, actual F902 speed measurement switches modes.
+  // Exactly 90.0 km/h is NOT an overspeed.
+  if (raw > OVERSPEED_LIMIT_RAW)
+  {
+    if (!overspeedActive)
+    {
+      overspeedActive = true;
+      overspeedStartedAtMs = millis();
+      overspeedLastShownSec = 0xFFFFFFFFUL;
+      Serial.println("OVERSPEED >90: elapsed seconds display ON");
+    }
+  }
+  else if (overspeedActive)
+  {
+    overspeedActive = false;
+    overspeedLastShownSec = 0xFFFFFFFFUL;
+    Serial.println("OVERSPEED <=90: standard screen restored");
+  }
   speedRetryPending = false;
   speedTimedOut = false;
   speedStaleDrawn = false;
@@ -1910,6 +1983,9 @@ bool startEverything()
   speedRetryPending = false;
   speedRetryAt = 0;
   speedRetryAttempts = 0;
+  overspeedActive = false;
+  overspeedStartedAtMs = 0;
+  overspeedLastShownSec = 0xFFFFFFFFUL;
   periodicOdoInFlight = false;
   nextOdoRequestAt = 0;
 
@@ -2111,8 +2187,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "F902RETRY 23.7",
-    "AUTO RETRY 3s",
+    "OVERSPEED 23.8",
+    "90+ SECONDS",
     "BLE ONLY"
   );
   delay(1200);
@@ -2210,6 +2286,10 @@ void loop()
   processRx();
 
   processCreditReturn();
+
+  // Update the overspeed clock every second even between F902 responses.
+  if (overspeedActive)
+    showOverspeedSeconds();
 
 
   // ========================================================
@@ -2396,6 +2476,8 @@ void loop()
   if (disconnected)
   {
     disconnected = false;
+    overspeedActive = false;
+    overspeedLastShownSec = 0xFFFFFFFFUL;
 
     state = ST_ERROR;
 
