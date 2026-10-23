@@ -188,6 +188,7 @@ bool speedValid = false;
 bool speedTimedOut = false;
 bool speedPayloadInvalid = false;
 bool manualOdoPending = false;
+bool speedStaleDrawn = false;
 uint8_t speedLastNrc = 0;
 uint16_t speedRaw = 0;
 float speedKmh = 0.0f;
@@ -396,6 +397,8 @@ void showSpeedAndOdometer()
     oled.print("F902 invalid");
   else if (speedTimedOut)
     oled.print("F902 timeout");
+  else if (speedStaleDrawn)
+    oled.print("F902 stale");
   else if (speedReplies > 0)
   {
     oled.print("F902 OK #");
@@ -413,6 +416,7 @@ void onOdometerReadOk()
   speedLastNrc = 0;
   speedTimedOut = false;
   speedPayloadInvalid = false;
+  speedStaleDrawn = false;
   nextSpeedRequestAt = millis() + SPEED_POLL_MS;
   showSpeedAndOdometer();
 }
@@ -420,6 +424,7 @@ void onOdometerReadOk()
 void speedReadFailed(uint8_t nrc, bool timeout, bool invalid)
 {
   speedPollingEnabled = false; // prevent repeated denied requests
+  speedStaleDrawn = false;
   speedValid = false;
   speedLastNrc = nrc;
   speedTimedOut = timeout;
@@ -448,6 +453,7 @@ void handleSpeedBytes(uint8_t msb, uint8_t lsb)
   speedKmh = raw / 256.0f;
   speedLastOkMs = millis();
   speedValid = true;
+  speedStaleDrawn = false;
   speedReplies++;
   state = ST_ODOMETER_OK;
   nextSpeedRequestAt = millis() + SPEED_POLL_MS;
@@ -1846,6 +1852,7 @@ bool startEverything()
   speedTimedOut = false;
   speedPayloadInvalid = false;
   manualOdoPending = false;
+  speedStaleDrawn = false;
   speedLastNrc = 0;
   speedRaw = 0;
   speedKmh = 0.0f;
@@ -2200,6 +2207,15 @@ void loop()
   {
     Serial.println("F902 TIMEOUT; keep F912 operational");
     speedReadFailed(0, true, false);
+  }
+
+  // If incoming F902 updates stop, remove the last speed from the screen.
+  // Redraw once, not continuously.
+  if (speedValid && !speedStaleDrawn &&
+      (uint32_t)(millis() - speedLastOkMs) > SPEED_STALE_MS)
+  {
+    speedStaleDrawn = true;
+    showSpeedAndOdometer();
   }
 
   // ========================================================
