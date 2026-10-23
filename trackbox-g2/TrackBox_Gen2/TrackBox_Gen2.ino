@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.6-F912AUTO";
+  "2026.10.23.7-F902RETRY3S";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -181,6 +181,11 @@ uint32_t retryOdometerAt = 0;
 // F902 is enabled only after F912 succeeds; disable on errors.
 static const uint32_t SPEED_POLL_MS = 1000;
 static const uint32_t SPEED_TIMEOUT_MS = 1700;
+// Retry F902 3 s after a timeout; keep the current BLE connection and F912.
+static const uint32_t SPEED_RETRY_MS = 3000;
+uint32_t speedRetryAt = 0;
+bool speedRetryPending = false;
+uint32_t speedRetryAttempts = 0;
 static const uint32_t SPEED_STALE_MS = 3500;
 
 // Automatic F912 refresh: 2-second cadence without interrupting F902.
@@ -403,7 +408,7 @@ void showSpeedAndOdometer()
   else if (speedPayloadInvalid)
     oled.print("F902 invalid");
   else if (speedTimedOut)
-    oled.print("F902 timeout");
+    oled.print("F902 T/O auto 3s");
   else if (speedStaleDrawn)
     oled.print("F902 stale");
   else if (speedReplies > 0)
@@ -439,7 +444,16 @@ void onOdometerReadOk()
 
 void speedReadFailed(uint8_t nrc, bool timeout, bool invalid)
 {
-  speedPollingEnabled = false; // prevent repeated denied requests
+  speedPollingEnabled = false;
+  // Only an actual timeout/temporary TX error is retried automatically.
+  // Tachograph NRC (e.g. lack of ITS consent) or invalid values must NOT
+  // be retried in a tight loop. F912 continues independently.
+  speedRetryPending = timeout && nrc == 0 && !invalid;
+  if (speedRetryPending)
+  {
+    speedRetryAt = millis() + SPEED_RETRY_MS;
+    Serial.println("F902 timeout: auto-retry scheduled in 3000 ms");
+  }
   speedStaleDrawn = false;
   speedValid = false;
   speedLastNrc = nrc;
@@ -469,6 +483,8 @@ void handleSpeedBytes(uint8_t msb, uint8_t lsb)
   speedKmh = raw / 256.0f;
   speedLastOkMs = millis();
   speedValid = true;
+  speedRetryPending = false;
+  speedTimedOut = false;
   speedStaleDrawn = false;
   speedReplies++;
   state = ST_ODOMETER_OK;
@@ -1891,6 +1907,9 @@ bool startEverything()
   speedLastOkMs = 0;
   nextSpeedRequestAt = 0;
   speedReplies = 0;
+  speedRetryPending = false;
+  speedRetryAt = 0;
+  speedRetryAttempts = 0;
   periodicOdoInFlight = false;
   nextOdoRequestAt = 0;
 
@@ -2092,8 +2111,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "F912AUTO 23.6",
-    "F912 + F902",
+    "F902RETRY 23.7",
+    "AUTO RETRY 3s",
     "BLE ONLY"
   );
   delay(1200);
@@ -2230,6 +2249,24 @@ void loop()
     firstReadSent = true;
     sendOdometerRequest();
   }
+  // Restore only the F902 polling state 3 seconds after a timeout.
+  // F912 continues throughout the pause. Do not overlap outstanding
+  // diagnostic requests, and do not restart BLE or StartCommunication.
+  if (speedRetryPending &&
+      (int32_t)(millis() - speedRetryAt) >= 0 &&
+      hasOdometer && state == ST_ODOMETER_OK &&
+      !manualOdoPending &&
+      client != nullptr && client->isConnected() &&
+      tachoCredits > 0)
+  {
+    speedRetryPending = false;
+    speedPollingEnabled = true;
+    speedRetryAttempts++;
+    Serial.printf("F902 auto-retry attempt #%lu\n",
+                  (unsigned long)speedRetryAttempts);
+    sendSpeedRequest();
+  }
+
   // Service a due odometer request ahead of the next speed query.
   // One diagnostic request in flight at any time.
   if (hasOdometer && !manualOdoPending &&
