@@ -1601,6 +1601,18 @@ void handleKwpFrame(
     );
 
 
+    // Ignore negative response to a background F912 request,
+    // keep the existing odometer and uninterrupted speed polling.
+    if (state == ST_WAIT_ODOMETER && periodicOdoInFlight)
+    {
+      Serial.printf("F912 periodic NRC=%02X; speed continues\n", nrc);
+      periodicOdoInFlight = false;
+      nextOdoRequestAt = millis() + ODO_RETRY_MS;
+      state = ST_ODOMETER_OK;
+      showSpeedAndOdometer();
+      return;
+    }
+
     // F902 NRC must not invoke F912 StartComm recovery.
     if (state == ST_WAIT_SPEED)
     {
@@ -1879,6 +1891,8 @@ bool startEverything()
   speedLastOkMs = 0;
   nextSpeedRequestAt = 0;
   speedReplies = 0;
+  periodicOdoInFlight = false;
+  nextOdoRequestAt = 0;
 
   tachoCredits = 0;
 
@@ -2078,7 +2092,7 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "F902TEST 23.5",
+    "F912AUTO 23.6",
     "F912 + F902",
     "BLE ONLY"
   );
@@ -2216,6 +2230,22 @@ void loop()
     firstReadSent = true;
     sendOdometerRequest();
   }
+  // Service a due odometer request ahead of the next speed query.
+  // One diagnostic request in flight at any time.
+  if (hasOdometer && !manualOdoPending &&
+      state == ST_ODOMETER_OK &&
+      client != nullptr && client->isConnected() &&
+      tachoCredits > 0 &&
+      (int32_t)(millis() - nextOdoRequestAt) >= 0)
+  {
+    periodicOdoInFlight = true;
+    if (!sendOdometerRequest())
+    {
+      periodicOdoInFlight = false;
+      nextOdoRequestAt = millis() + ODO_RETRY_MS;
+    }
+  }
+
   if (state == ST_ODOMETER_OK && speedPollingEnabled &&
       !manualOdoPending && tachoCredits > 0 &&
       (int32_t)(millis() - nextSpeedRequestAt) >= 0)
@@ -2245,7 +2275,17 @@ void loop()
   if (state == ST_WAIT_ODOMETER &&
       millis() - requestStartMs > 1500)
   {
-    if (!fallbackStartCommUsed)
+    if (periodicOdoInFlight)
+    {
+      // Skip only the failed background F912, without a disruptive
+      // StartCommunication fallback, preserving the speed session.
+      periodicOdoInFlight = false;
+      nextOdoRequestAt = millis() + ODO_RETRY_MS;
+      state = ST_ODOMETER_OK;
+      Serial.println("F912 periodic timeout; speed continues");
+      showSpeedAndOdometer();
+    }
+    else if (!fallbackStartCommUsed)
     {
       fallbackStartCommUsed = true;
 
