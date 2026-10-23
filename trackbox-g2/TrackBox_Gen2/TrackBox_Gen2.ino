@@ -1341,7 +1341,6 @@ void handleKwpFrame(
 
     state = ST_ODOMETER_OK;
 
-    showOdometer();
     onOdometerReadOk();
 
     return;
@@ -1520,7 +1519,6 @@ void handleKwpFrame(
 
     state = ST_ODOMETER_OK;
 
-    showOdometer();
     onOdometerReadOk();
 
     return;
@@ -2346,16 +2344,21 @@ void loop()
   {
     if ((state == ST_DIAG_READY ||
          state == ST_ODOMETER_OK ||
+         state == ST_WAIT_SPEED ||
          state == ST_ERROR) &&
         client != nullptr &&
-        client->isConnected() &&
-        tachoCredits > 0)
+        client->isConnected())
     {
-      fallbackStartCommUsed = false;
-
-      firstReadSent = true;
-
-      sendOdometerRequest();
+      // A pending F902 response must not overlap an F912 query.
+      if (state == ST_WAIT_SPEED || tachoCredits <= 0)
+        manualOdoPending = true;
+      else
+      {
+        manualOdoPending = false;
+        fallbackStartCommUsed = false;
+        firstReadSent = true;
+        sendOdometerRequest();
+      }
     }
   }
 
