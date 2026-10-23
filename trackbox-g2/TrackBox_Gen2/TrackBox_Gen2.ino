@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.3-RXTRACE";
+  "2026.10.23.4-ITSFRAME";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -464,12 +464,30 @@ bool sendDiagPacket(
     return false;
   }
 
-  printHex("TX FIFO: ", data, length);
+  // Smart Tachograph V2 ITS Transport Protocol, sec. 4.6.4:
+  // First BLE packet: [totalPackets=1][packetNumber=1][diagnostic data].
+  // Our F912 and StartComm requests each fit one minimum-MTU packet.
+  // Min ATT_MTU=23, ATT overhead=3 => 20 value bytes;
+  // the 2 packet-info bytes leave up to 18 diagnostic bytes.
+  if (data == nullptr || length == 0 || length > 18)
+  {
+    Serial.println("TX ERROR: payload outside single-packet limit");
+    return false;
+  }
+
+  uint8_t framed[20] = {0};
+  framed[0] = 0x01;
+  framed[1] = 0x01;
+  memcpy(&framed[2], data, length);
+  const size_t framedLength = length + 2;
+
+  printHex("TX APP: ", data, length);
+  printHex("TX FIFO: ", framed, framedLength);
 
   bool ok =
     diagFifo->writeValue(
-      data,
-      length,
+      framed,
+      framedLength,
       true
     );
 
@@ -1476,10 +1494,21 @@ void processRx()
   portEXIT_CRITICAL(&rxMux);
 
 
-  handleKwpFrame(
-    local,
-    len
-  );
+  // The ITS transport adds packet information before the
+  // application frame. Accept one-packet responses only here.
+  // Leave the raw-data fallback for comparison with prior firmware.
+  if (len >= 3 &&
+      local[0] == 0x01 &&
+      local[1] == 0x01)
+  {
+    Serial.println("RX ITS: single packet, remove [01 01]");
+    handleKwpFrame(local + 2, len - 2);
+  }
+  else
+  {
+    Serial.println("RX ITS: raw or unsupported packet header");
+    handleKwpFrame(local, len);
+  }
 }
 
 
@@ -1846,8 +1875,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "RXTRACE 23.3",
-    "Oryginalny odczyt",
+    "ITSFRAME 23.4",
+    "F912 + [01 01]",
     "BLE ONLY"
   );
   delay(1200);
