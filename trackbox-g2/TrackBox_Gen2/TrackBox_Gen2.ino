@@ -1342,11 +1342,26 @@ void handleKwpFrame(
     state = ST_ODOMETER_OK;
 
     showOdometer();
+    onOdometerReadOk();
 
     return;
   }
 
 
+  // RAW UDS positive: 62 F9 02 HI LO
+  if (length >= 5 && data[0] == SID_READ_DATA_POS &&
+      data[1] == 0xF9 && data[2] == 0x02)
+  {
+    handleSpeedBytes(data[3], data[4]);
+    return;
+  }
+  // RAW UDS negative: 7F 22 NRC
+  if (length >= 3 && state == ST_WAIT_SPEED &&
+      data[0] == SID_NEGATIVE && data[1] == SID_READ_DATA)
+  {
+    speedReadFailed(data[2], false, false);
+    return;
+  }
   // --------------------------------------------------------
   // KWP FRAME
   // --------------------------------------------------------
@@ -1403,6 +1418,13 @@ void handleKwpFrame(
 
   uint8_t sid = data[4];
 
+  // Positive F902 KWP: 80 tgt src 05 62 F9 02 HI LO CS.
+  if (sid == SID_READ_DATA_POS && length >= 10 &&
+      data[5] == 0xF9 && data[6] == 0x02)
+  {
+    handleSpeedBytes(data[7], data[8]);
+    return;
+  }
 
   // ========================================================
   // POSITIVE F912
@@ -1499,6 +1521,7 @@ void handleKwpFrame(
     state = ST_ODOMETER_OK;
 
     showOdometer();
+    onOdometerReadOk();
 
     return;
   }
@@ -1553,6 +1576,13 @@ void handleKwpFrame(
       nrc
     );
 
+
+    // F902 NRC must not invoke F912 StartComm recovery.
+    if (state == ST_WAIT_SPEED)
+    {
+      speedReadFailed(nrc, false, false);
+      return;
+    }
 
     // Jezeli pierwsze F912 dostanie
     // ConditionsNotCorrect 0x22,
@@ -1812,6 +1842,18 @@ bool startEverything()
   traceF912TxOk = 0;
   traceStartTxOk = 0;
   traceSecureOk = false;
+  hasOdometer = false;
+  speedPollingEnabled = false;
+  speedValid = false;
+  speedTimedOut = false;
+  speedPayloadInvalid = false;
+  manualOdoPending = false;
+  speedLastNrc = 0;
+  speedRaw = 0;
+  speedKmh = 0.0f;
+  speedLastOkMs = 0;
+  nextSpeedRequestAt = 0;
+  speedReplies = 0;
 
   tachoCredits = 0;
 
@@ -2011,8 +2053,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "ITSFRAME 23.4",
-    "F912 + [01 01]",
+    "F902TEST 23.5",
+    "F912 + F902",
     "BLE ONLY"
   );
   delay(1200);
@@ -2139,6 +2181,28 @@ void loop()
     sendOdometerRequest();
   }
 
+
+  // Poll F902 only after successful F912. Never overlap queries.
+  if (manualOdoPending && state == ST_ODOMETER_OK &&
+      client != nullptr && client->isConnected() && tachoCredits > 0)
+  {
+    manualOdoPending = false;
+    fallbackStartCommUsed = false;
+    firstReadSent = true;
+    sendOdometerRequest();
+  }
+  if (state == ST_ODOMETER_OK && speedPollingEnabled &&
+      !manualOdoPending && tachoCredits > 0 &&
+      (int32_t)(millis() - nextSpeedRequestAt) >= 0)
+  {
+    sendSpeedRequest();
+  }
+  if (state == ST_WAIT_SPEED &&
+      (uint32_t)(millis() - requestStartMs) > SPEED_TIMEOUT_MS)
+  {
+    Serial.println("F902 TIMEOUT; keep F912 operational");
+    speedReadFailed(0, true, false);
+  }
 
   // ========================================================
   // TIMEOUT F912
