@@ -6,7 +6,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.23.4-ITSFRAME";
+  "2026.10.23.5-F902TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -101,6 +101,7 @@ static const uint8_t SID_NEGATIVE = 0x7F;
 
 // F912
 static const uint16_t DID_ODOMETER = 0xF912;
+static const uint16_t DID_SPEED = 0xF902; // ISO 16844-7: 2 bytes / 256 km/h
 
 
 // ============================================================
@@ -129,6 +130,7 @@ enum State
   ST_WAIT_ODOMETER,
   ST_WAIT_STARTCOMM,
   ST_ODOMETER_OK,
+  ST_WAIT_SPEED,
   ST_ERROR
 };
 
@@ -175,6 +177,24 @@ uint32_t diagReadyMs = 0;
 
 bool retryOdometerPending = false;
 uint32_t retryOdometerAt = 0;
+
+// F902 is enabled only after F912 succeeds; disable on errors.
+static const uint32_t SPEED_POLL_MS = 1000;
+static const uint32_t SPEED_TIMEOUT_MS = 1700;
+static const uint32_t SPEED_STALE_MS = 3500;
+bool hasOdometer = false;
+bool speedPollingEnabled = false;
+bool speedValid = false;
+bool speedTimedOut = false;
+bool speedPayloadInvalid = false;
+bool manualOdoPending = false;
+bool speedStaleDrawn = false;
+uint8_t speedLastNrc = 0;
+uint16_t speedRaw = 0;
+float speedKmh = 0.0f;
+uint32_t speedLastOkMs = 0;
+uint32_t nextSpeedRequestAt = 0;
+uint32_t speedReplies = 0;
 
 
 // ============================================================
@@ -343,6 +363,102 @@ void showOdometer()
   oled.print(tachoCredits);
 
   oled.sendBuffer();
+}
+
+// Draw both odometer and instantaneous speed on 128x64 SH1106.
+// Full-buffer send avoids explicit visible clears/flicker.
+void showSpeedAndOdometer()
+{
+  drawHeader("TrackBox G2 F902");
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.setCursor(0, 25);
+  oled.print("ODO ");
+  oled.print(odometerKm, 3);
+  oled.print(" km");
+
+  oled.setFont(u8g2_font_7x14B_tf);
+  oled.setCursor(0, 46);
+  if (speedValid && (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS)
+    oled.print(speedKmh, 1);
+  else
+    oled.print("--.-");
+
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.setCursor(78, 44);
+  oled.print("km/h");
+  oled.setCursor(0, 60);
+  if (speedLastNrc)
+  {
+    oled.print("F902 NRC 0x");
+    if (speedLastNrc < 16) oled.print('0');
+    oled.print(speedLastNrc, HEX);
+  }
+  else if (speedPayloadInvalid)
+    oled.print("F902 invalid");
+  else if (speedTimedOut)
+    oled.print("F902 timeout");
+  else if (speedStaleDrawn)
+    oled.print("F902 stale");
+  else if (speedReplies > 0)
+  {
+    oled.print("F902 OK #");
+    oled.print(speedReplies);
+  }
+  else
+    oled.print("F902 waiting...");
+  oled.sendBuffer();
+}
+
+void onOdometerReadOk()
+{
+  hasOdometer = true;
+  speedPollingEnabled = true;
+  speedLastNrc = 0;
+  speedTimedOut = false;
+  speedPayloadInvalid = false;
+  speedStaleDrawn = false;
+  nextSpeedRequestAt = millis() + SPEED_POLL_MS;
+  showSpeedAndOdometer();
+}
+
+void speedReadFailed(uint8_t nrc, bool timeout, bool invalid)
+{
+  speedPollingEnabled = false; // prevent repeated denied requests
+  speedStaleDrawn = false;
+  speedValid = false;
+  speedLastNrc = nrc;
+  speedTimedOut = timeout;
+  speedPayloadInvalid = invalid;
+  state = ST_ODOMETER_OK;
+  showSpeedAndOdometer();
+}
+
+void handleSpeedBytes(uint8_t msb, uint8_t lsb)
+{
+  if (state != ST_WAIT_SPEED)
+  {
+    Serial.println("F902 unsolicited - ignored");
+    return;
+  }
+
+  const uint16_t raw = ((uint16_t)msb << 8) | lsb;
+  if (raw > 0xFAFF) // ISO range 0...250.996 km/h
+  {
+    Serial.printf("F902 invalid raw=%04X\n", raw);
+    speedReadFailed(0, false, true);
+    return;
+  }
+
+  speedRaw = raw;
+  speedKmh = raw / 256.0f;
+  speedLastOkMs = millis();
+  speedValid = true;
+  speedStaleDrawn = false;
+  speedReplies++;
+  state = ST_ODOMETER_OK;
+  nextSpeedRequestAt = millis() + SPEED_POLL_MS;
+  Serial.printf("F902 speed=%.3f km/h raw=%04X\n", speedKmh, raw);
+  showSpeedAndOdometer();
 }
 
 
@@ -563,6 +679,32 @@ bool sendOdometerRequest()
   return true;
 }
 
+
+// ============================================================
+// F902 TVS: same proven single-packet KWP/ITS transport.
+// Frame: 80 EE F0 03 22 F9 02 CS, ITS prefix [01 01].
+// ============================================================
+bool sendSpeedRequest()
+{
+  if (!hasOdometer || !speedPollingEnabled ||
+      state != ST_ODOMETER_OK || tachoCredits <= 0)
+    return false;
+
+  uint8_t msg[8] = {0x80, VU_ADDRESS, TESTER_ADDRESS,
+                    0x03, SID_READ_DATA, 0xF9, 0x02, 0};
+  msg[7] = kwpChecksum(msg, 7);
+  if (!sendDiagPacket(msg, sizeof(msg)))
+  {
+    Serial.println("F902 TX failed; polling paused");
+    speedReadFailed(0, true, false);
+    return false;
+  }
+
+  state = ST_WAIT_SPEED;
+  requestStartMs = millis();
+  Serial.println("F902 request sent");
+  return true;
+}
 
 // ============================================================
 // START COMMUNICATION
@@ -1205,12 +1347,26 @@ void handleKwpFrame(
 
     state = ST_ODOMETER_OK;
 
-    showOdometer();
+    onOdometerReadOk();
 
     return;
   }
 
 
+  // RAW UDS positive: 62 F9 02 HI LO
+  if (length >= 5 && data[0] == SID_READ_DATA_POS &&
+      data[1] == 0xF9 && data[2] == 0x02)
+  {
+    handleSpeedBytes(data[3], data[4]);
+    return;
+  }
+  // RAW UDS negative: 7F 22 NRC
+  if (length >= 3 && state == ST_WAIT_SPEED &&
+      data[0] == SID_NEGATIVE && data[1] == SID_READ_DATA)
+  {
+    speedReadFailed(data[2], false, false);
+    return;
+  }
   // --------------------------------------------------------
   // KWP FRAME
   // --------------------------------------------------------
@@ -1267,6 +1423,13 @@ void handleKwpFrame(
 
   uint8_t sid = data[4];
 
+  // Positive F902 KWP: 80 tgt src 05 62 F9 02 HI LO CS.
+  if (sid == SID_READ_DATA_POS && length >= 10 &&
+      data[5] == 0xF9 && data[6] == 0x02)
+  {
+    handleSpeedBytes(data[7], data[8]);
+    return;
+  }
 
   // ========================================================
   // POSITIVE F912
@@ -1362,7 +1525,7 @@ void handleKwpFrame(
 
     state = ST_ODOMETER_OK;
 
-    showOdometer();
+    onOdometerReadOk();
 
     return;
   }
@@ -1417,6 +1580,13 @@ void handleKwpFrame(
       nrc
     );
 
+
+    // F902 NRC must not invoke F912 StartComm recovery.
+    if (state == ST_WAIT_SPEED)
+    {
+      speedReadFailed(nrc, false, false);
+      return;
+    }
 
     // Jezeli pierwsze F912 dostanie
     // ConditionsNotCorrect 0x22,
@@ -1676,6 +1846,19 @@ bool startEverything()
   traceF912TxOk = 0;
   traceStartTxOk = 0;
   traceSecureOk = false;
+  hasOdometer = false;
+  speedPollingEnabled = false;
+  speedValid = false;
+  speedTimedOut = false;
+  speedPayloadInvalid = false;
+  manualOdoPending = false;
+  speedStaleDrawn = false;
+  speedLastNrc = 0;
+  speedRaw = 0;
+  speedKmh = 0.0f;
+  speedLastOkMs = 0;
+  nextSpeedRequestAt = 0;
+  speedReplies = 0;
 
   tachoCredits = 0;
 
@@ -1875,8 +2058,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "ITSFRAME 23.4",
-    "F912 + [01 01]",
+    "F902TEST 23.5",
+    "F912 + F902",
     "BLE ONLY"
   );
   delay(1200);
@@ -2003,6 +2186,37 @@ void loop()
     sendOdometerRequest();
   }
 
+
+  // Poll F902 only after successful F912. Never overlap queries.
+  if (manualOdoPending && state == ST_ODOMETER_OK &&
+      client != nullptr && client->isConnected() && tachoCredits > 0)
+  {
+    manualOdoPending = false;
+    fallbackStartCommUsed = false;
+    firstReadSent = true;
+    sendOdometerRequest();
+  }
+  if (state == ST_ODOMETER_OK && speedPollingEnabled &&
+      !manualOdoPending && tachoCredits > 0 &&
+      (int32_t)(millis() - nextSpeedRequestAt) >= 0)
+  {
+    sendSpeedRequest();
+  }
+  if (state == ST_WAIT_SPEED &&
+      (uint32_t)(millis() - requestStartMs) > SPEED_TIMEOUT_MS)
+  {
+    Serial.println("F902 TIMEOUT; keep F912 operational");
+    speedReadFailed(0, true, false);
+  }
+
+  // If incoming F902 updates stop, remove the last speed from the screen.
+  // Redraw once, not continuously.
+  if (speedValid && !speedStaleDrawn &&
+      (uint32_t)(millis() - speedLastOkMs) > SPEED_STALE_MS)
+  {
+    speedStaleDrawn = true;
+    showSpeedAndOdometer();
+  }
 
   // ========================================================
   // TIMEOUT F912
@@ -2146,16 +2360,21 @@ void loop()
   {
     if ((state == ST_DIAG_READY ||
          state == ST_ODOMETER_OK ||
+         state == ST_WAIT_SPEED ||
          state == ST_ERROR) &&
         client != nullptr &&
-        client->isConnected() &&
-        tachoCredits > 0)
+        client->isConnected())
     {
-      fallbackStartCommUsed = false;
-
-      firstReadSent = true;
-
-      sendOdometerRequest();
+      // A pending F902 response must not overlap an F912 query.
+      if (state == ST_WAIT_SPEED || tachoCredits <= 0)
+        manualOdoPending = true;
+      else
+      {
+        manualOdoPending = false;
+        fallbackStartCommUsed = false;
+        firstReadSent = true;
+        sendOdometerRequest();
+      }
     }
   }
 
