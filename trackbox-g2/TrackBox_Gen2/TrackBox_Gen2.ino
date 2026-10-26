@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.17-23_11-RXSAFE-TEST";
+  "2026.10.26.18-23_11-RXSAFE-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -2441,7 +2441,8 @@ void loop()
       !manualOdoPending && tachoCredits > 0 &&
       (int32_t)(millis() - nextTimeSyncAtMs) >= 0)
   {
-    sendTimeRequest();
+    if (!sendTimeRequest())
+      stopDiagnosticPolling("F90B TX FAIL");
   }
 
   if (state == ST_WAIT_TIME &&
@@ -2466,8 +2467,7 @@ void loop()
     periodicOdoInFlight = true;
     if (!sendOdometerRequest())
     {
-      periodicOdoInFlight = false;
-      nextOdoRequestAt = millis() + ODO_RETRY_MS;
+      stopDiagnosticPolling("F912 TX FAIL");
     }
   }
 
@@ -2636,7 +2636,8 @@ void loop()
       delay(600);
       restartConnection();
     }
-    else if ((state == ST_DIAG_READY ||
+    else if (!diagnosticsPaused &&
+             (state == ST_DIAG_READY ||
          state == ST_ODOMETER_OK ||
          state == ST_WAIT_SPEED ||
          state == ST_ERROR) &&
