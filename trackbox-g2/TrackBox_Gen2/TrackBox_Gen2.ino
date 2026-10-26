@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.20-23_11-RXPROTECT-TEST";
+  "2026.10.26.21-23_11-RXPROTECT-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -1762,14 +1762,8 @@ void handleKwpFrame(
         data[7]
       );
 
-      state = ST_ERROR;
+      stopDiagnosticPolling("F912 INVALID");
 
-      showMessage(
-        "TrackBox G2 ODO",
-        "F912 indicator",
-        String("0x") +
-        String(data[7], HEX)
-      );
 
       return;
     }
@@ -1921,25 +1915,10 @@ void handleKwpFrame(
     }
 
 
-    state = ST_ERROR;
-
-    char temp[24];
-
-    snprintf(
-      temp,
-      sizeof(temp),
-      "SID %02X NRC %02X",
-      rejectedService,
-      nrc
-    );
-
-
-    showMessage(
-      "TrackBox G2 ERROR",
-      "Negative response",
-      String(temp),
-      "CONFIRM=retry"
-    );
+    char reason[24];
+    snprintf(reason, sizeof(reason), "NRC %02X/%02X",
+             rejectedService, nrc);
+    stopDiagnosticPolling(reason);
 
     return;
   }
@@ -2359,7 +2338,7 @@ void setup()
     "TrackBox G2 F912",
     "LOCALCLOCK 23.11",
     "F90B CLOCK TEST",
-    "RXPROTECT 26.20"
+    "RXPROTECT 26.21"
   );
   delay(1200);
 
@@ -2588,42 +2567,14 @@ void loop()
   // TIMEOUT START COMM
   // ========================================================
 
-  if (state == ST_WAIT_STARTCOMM &&
-      millis() - requestStartMs > 1500)
+  if (!diagnosticsPaused && state == ST_WAIT_STARTCOMM &&
+      (uint32_t)(millis() - requestStartMs) > 1500UL)
   {
     stopDiagnosticPolling("STARTCOMM TIMEOUT");
-    return;
-
-    uint32_t fifoCount = 0;
-    uint32_t creditCount = 0;
-    portENTER_CRITICAL(&rxMux);
-    fifoCount = traceFifoCb;
-    portEXIT_CRITICAL(&rxMux);
-    portENTER_CRITICAL(&creditMux);
-    creditCount = traceCreditCb;
-    portEXIT_CRITICAL(&creditMux);
-
-    showMessage(
-      "TrackBox RX TRACE",
-      "StartComm TIMEOUT",
-      String("CR:") + creditCount +
-        " FIFO:" + fifoCount +
-        " P:" + traceParseCount,
-      String("TX:") + traceF912TxOk +
-        "/" + traceStartTxOk +
-        " C:" + tachoCredits,
-      String("BLE:") +
-        ((client && client->isConnected()) ? "1" : "0") +
-        " SEC:" + (traceSecureOk ? "1" : "0") +
-        " CS:" + traceBadChecksum
-    );
-
-    Serial.println(
-      "StartCommunication: NO RESPONSE"
-    );
   }
 
 
+  // ========================================================
   // ========================================================
   // DISCONNECT
   // ========================================================
