@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.21-23_11-RXPROTECT-TEST";
+  "2026.10.26.22-F902TRACE-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -221,6 +221,19 @@ float speedKmh = 0.0f;
 uint32_t speedLastOkMs = 0;
 uint32_t nextSpeedRequestAt = 0;
 uint32_t speedReplies = 0;
+
+// Passive F902 diagnosis: no additional requests, and no automatic retry.
+// Only F902 TIMEOUT uses a 1.5 s receive-only grace period before clean BLE close.
+static const uint32_t F902_PASSIVE_GRACE_MS = 1500UL;
+uint32_t f902GraceUntilMs = 0;
+uint32_t f902TimeoutLastValidAgeMs = 0;
+uint32_t traceF902TxOk = 0;
+uint32_t traceF902RxOk = 0;
+uint32_t traceF902Late = 0;
+uint32_t traceF902ChecksumBad = 0;
+uint32_t traceF902Unexpected = 0;
+uint32_t traceF902LastRttMs = 0;
+uint32_t traceF902MaxRttMs = 0;
 
 // F90B TimeDate is queried independently, only when F902/F912 are idle.
 // RTC holds local time while power remains on; no Wi-Fi is used in run mode.
@@ -608,6 +621,17 @@ void closeItsSession()
   transportConfigured = false;
 }
 
+void showF902Trace()
+{
+  // Four concise lines fit SH1106 128x64 and can be photographed.
+  showMessage("F902 TIMEOUT",
+              String("TX:") + traceF902TxOk + " OK:" + traceF902RxOk,
+              String("CS:") + traceF902ChecksumBad + " LATE:" + traceF902Late,
+              String("BAD:") + traceF902Unexpected +
+                " AGE:" + (f902TimeoutLastValidAgeMs / 1000UL) + "s",
+              "STOP / BACK");
+}
+
 void stopDiagnosticPolling(const char* reason)
 {
   if (diagnosticsPaused) return;
@@ -631,7 +655,25 @@ void stopDiagnosticPolling(const char* reason)
       reason, (unsigned long)fifoFrames,
       (unsigned long)traceParseCount, (unsigned long)creditEvents,
       (unsigned long)traceF912TxOk);
-  // Release the diagnostic transport and BLE connection once on failure.
+  // On F902 timeout, stop transmitting IMMEDIATELY but listen passively
+  // for 1.5 seconds, to distinguish a late F902 response from a lost one.
+  // The session is closed gracefully after the passive interval.
+  if (strcmp(reason, "F902 TIMEOUT") == 0)
+  {
+    f902TimeoutLastValidAgeMs =
+      speedLastOkMs ? (uint32_t)(millis() - speedLastOkMs) : 0UL;
+    f902GraceUntilMs = millis() + F902_PASSIVE_GRACE_MS;
+    Serial.printf("F902 diagnosis TX=%lu OK=%lu CS=%lu LATE=%lu BAD=%lu lastRTT=%lu maxRTT=%lu age=%lu ms FIFO=%lu PAR=%lu\\n",
+       (unsigned long)traceF902TxOk, (unsigned long)traceF902RxOk,
+       (unsigned long)traceF902ChecksumBad, (unsigned long)traceF902Late,
+       (unsigned long)traceF902Unexpected,
+       (unsigned long)traceF902LastRttMs, (unsigned long)traceF902MaxRttMs,
+       (unsigned long)f902TimeoutLastValidAgeMs, (unsigned long)fifoFrames,
+       (unsigned long)traceParseCount);
+    showF902Trace();
+    return;
+  }
+  // Any other fault: close ITS and BLE immediately, as in 26.21.
   expectedDisconnect = true;
   closeItsSession();
   if (client != nullptr && client->isConnected())
@@ -679,13 +721,16 @@ void handleSpeedBytes(uint8_t msb, uint8_t lsb)
 {
   if (state != ST_WAIT_SPEED)
   {
-    Serial.println("F902 unsolicited - ignored");
+    traceF902Late++;
+    Serial.printf("Late/unexpected F902 positive: state=%d count=%lu\\n",
+                  (int)state, (unsigned long)traceF902Late);
     return;
   }
 
   const uint16_t raw = ((uint16_t)msb << 8) | lsb;
   if (raw > 0xFAFF) // ISO range 0...250.996 km/h
   {
+    traceF902Unexpected++;
     Serial.printf("F902 invalid raw=%04X\n", raw);
     speedReadFailed(0, false, true);
     return;
@@ -694,6 +739,10 @@ void handleSpeedBytes(uint8_t msb, uint8_t lsb)
   speedRaw = raw;
   speedKmh = raw / 256.0f;
   speedLastOkMs = millis();
+  traceF902RxOk++;
+  traceF902LastRttMs = (uint32_t)(speedLastOkMs - requestStartMs);
+  if (traceF902LastRttMs > traceF902MaxRttMs)
+    traceF902MaxRttMs = traceF902LastRttMs;
   speedValid = true;
 
   // Only a valid, actual F902 speed measurement switches modes.
@@ -969,7 +1018,9 @@ bool sendSpeedRequest()
 
   state = ST_WAIT_SPEED;
   requestStartMs = millis();
-  Serial.println("F902 request sent");
+  traceF902TxOk++;
+  Serial.printf("F902 request %lu sent\\n",
+                (unsigned long)traceF902TxOk);
   return true;
 }
 
@@ -1574,6 +1625,33 @@ void handleKwpFrame(
 )
 {
   traceParseCount++;
+  // During passive F902 timeout diagnosis NO responses may affect the
+  // application state. Inspect only the F902 positive reply bytes.
+  if (diagnosticsPaused)
+  {
+    if (f902GraceUntilMs != 0)
+    {
+      if (length >= 5 && data[0] == SID_READ_DATA_POS &&
+          data[1] == 0xF9 && data[2] == 0x02)
+        traceF902Late++;
+      else if (length >= 10 && data[0] == 0x80 &&
+               data[4] == SID_READ_DATA_POS &&
+               data[5] == 0xF9 && data[6] == 0x02)
+      {
+        if (checkKwpChecksum(data, length))
+          traceF902Late++;
+        else
+        {
+          traceBadChecksum++;
+          traceF902ChecksumBad++;
+        }
+      }
+      Serial.printf("Passive RX: bytes=%u F902late=%lu CS=%lu\\n",
+                    (unsigned)length, (unsigned long)traceF902Late,
+                    (unsigned long)traceF902ChecksumBad);
+    }
+    return;
+  }
   Serial.println();
 
   printHex(
@@ -1658,6 +1736,7 @@ void handleKwpFrame(
 
   if (length < 6)
   {
+    if (state == ST_WAIT_SPEED) traceF902Unexpected++;
     Serial.println(
       "RX too short"
     );
@@ -1669,6 +1748,10 @@ void handleKwpFrame(
   if (!checkKwpChecksum(data, length))
   {
     traceBadChecksum++;
+    if (length >= 10 && data[0] == 0x80 &&
+        data[4] == SID_READ_DATA_POS &&
+        data[5] == 0xF9 && data[6] == 0x02)
+      traceF902ChecksumBad++;
     Serial.println(
       "WARNING: checksum incorrect"
     );
@@ -1697,6 +1780,7 @@ void handleKwpFrame(
 
   if (data[0] != 0x80)
   {
+    if (state == ST_WAIT_SPEED) traceF902Unexpected++;
     Serial.printf(
       "Unknown FMT: %02X\n",
       data[0]
@@ -1924,6 +2008,7 @@ void handleKwpFrame(
   }
 
 
+  if (state == ST_WAIT_SPEED) traceF902Unexpected++;
   Serial.printf(
     "Other response SID=0x%02X\n",
     sid
@@ -1951,7 +2036,9 @@ void processRx()
     pending=true;
   }
   portEXIT_CRITICAL(&rxMux);
-  if (!pending || diagnosticsPaused) return;
+  // On a F902 timeout, remain receive-only during the short grace period.
+  // No returned credits and no diagnostic request are permitted in this mode.
+  if (!pending || (diagnosticsPaused && f902GraceUntilMs == 0)) return;
 
   // Preserve the known working 23.11 single-packet [01 01] decoder
   // and its raw KWP fallback. Never silently accept a continuation.
@@ -2097,6 +2184,15 @@ bool startEverything()
   diagnosticsPaused = false;
   traceParseCount = 0;
   traceBadChecksum = 0;
+  traceF902TxOk = 0;
+  traceF902RxOk = 0;
+  traceF902Late = 0;
+  traceF902ChecksumBad = 0;
+  traceF902Unexpected = 0;
+  traceF902LastRttMs = 0;
+  traceF902MaxRttMs = 0;
+  f902GraceUntilMs = 0;
+  f902TimeoutLastValidAgeMs = 0;
   traceF912TxOk = 0;
   traceStartTxOk = 0;
   traceSecureOk = false;
@@ -2338,7 +2434,7 @@ void setup()
     "TrackBox G2 F912",
     "LOCALCLOCK 23.11",
     "F90B CLOCK TEST",
-    "RXPROTECT 26.21"
+    "F902 TRACE 26.22"
   );
   delay(1200);
 
@@ -2435,6 +2531,27 @@ void loop()
   processCredits();
   processRx();
   processCreditReturn();
+
+  // Finish F902 receive-only grace after timeout, with zero additional
+  // diagnostic requests. Display final counters including late arrivals.
+  if (diagnosticsPaused && f902GraceUntilMs != 0 &&
+      (int32_t)(millis() - f902GraceUntilMs) >= 0)
+  {
+    f902GraceUntilMs = 0;
+    expectedDisconnect = true;
+    closeItsSession();
+    if (client != nullptr && client->isConnected())
+      client->disconnect();
+    showF902Trace();
+    Serial.printf("F902 trace FINAL TX:%lu RX:%lu CRC:%lu LATE:%lu BAD:%lu RTT:%lu/%lu ms\\n",
+                  (unsigned long)traceF902TxOk,
+                  (unsigned long)traceF902RxOk,
+                  (unsigned long)traceF902ChecksumBad,
+                  (unsigned long)traceF902Late,
+                  (unsigned long)traceF902Unexpected,
+                  (unsigned long)traceF902LastRttMs,
+                  (unsigned long)traceF902MaxRttMs);
+  }
 
   // Update the overspeed clock every second even between F902 responses.
   if (overspeedActive)
