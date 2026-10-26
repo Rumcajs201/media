@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.16-ROLLBACK23-11-TEST";
+  "2026.10.26.17-23_11-RXSAFE-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -190,24 +190,26 @@ bool retryOdometerPending = false;
 uint32_t retryOdometerAt = 0;
 
 // F902 is enabled only after F912 succeeds; disable on errors.
-static const uint32_t SPEED_POLL_MS = 1000;
-static const uint32_t SPEED_TIMEOUT_MS = 1700;
+static const uint32_t SPEED_POLL_MS = 3000;
+static const uint32_t SPEED_TIMEOUT_MS = 2500;
 // Retry F902 3 s after a timeout; keep the current BLE connection and F912.
 static const uint32_t SPEED_RETRY_MS = 3000;
 uint32_t speedRetryAt = 0;
 bool speedRetryPending = false;
 uint32_t speedRetryAttempts = 0;
-static const uint32_t SPEED_STALE_MS = 3500;
+static const uint32_t SPEED_STALE_MS = 6000;
 
 // Automatic F912 refresh: 2-second cadence without interrupting F902.
 // On periodic failure retry later; never send StartCommunication as fallback.
-static const uint32_t ODO_POLL_MS = 2000;
+static const uint32_t ODO_POLL_MS = 15000;
 static const uint32_t ODO_RETRY_MS = 6000;
+static const uint32_t ODO_PERIODIC_TIMEOUT_MS = 4000;
 uint32_t nextOdoRequestAt = 0;
 bool periodicOdoInFlight = false;
 bool hasOdometer = false;
 bool speedPollingEnabled = false;
 bool speedValid = false;
+bool diagnosticsPaused = false;
 bool speedTimedOut = false;
 bool speedPayloadInvalid = false;
 bool manualOdoPending = false;
@@ -245,13 +247,14 @@ uint32_t overspeedLastShownSec = 0xFFFFFFFFUL;
 portMUX_TYPE rxMux =
   portMUX_INITIALIZER_UNLOCKED;
 
-volatile bool rxPending = false;
-
-uint8_t rxBuffer[128];
-size_t rxLength = 0;
-
-
-// Kredyty, ktore trzeba oddac tachografowi
+// The original 23.11 grants 32 RX credits; provide 32 actual slots.
+// Preserve the proven 32-credit handshake, 01 01 TX frame, and StartComm.
+static const uint8_t RX_CAPACITY = 32;
+static const size_t RX_MAX_LEN = 128;
+struct RxPacket { uint8_t data[RX_MAX_LEN]; uint8_t len; };
+RxPacket rxQueue[RX_CAPACITY];
+volatile uint8_t rxHead = 0, rxTail = 0, rxCount = 0;
+volatile bool rxOverflow = false;
 volatile uint8_t creditsToReturn = 0;
 
 
@@ -262,9 +265,8 @@ volatile uint8_t creditsToReturn = 0;
 portMUX_TYPE creditMux =
   portMUX_INITIALIZER_UNLOCKED;
 
-volatile bool creditEvent = false;
-volatile uint8_t creditReceived = 0;
-
+volatile uint16_t creditReceivedPending = 0;
+volatile bool creditOverflow = false;
 volatile bool creditRejected = false;
 
 
@@ -587,6 +589,34 @@ void showSpeedAndOdometer()
 }
 
 
+void stopDiagnosticPolling(const char* reason)
+{
+  if (diagnosticsPaused) return;
+  diagnosticsPaused = true;
+  speedPollingEnabled = false;
+  speedRetryPending = false;
+  retryOdometerPending = false;
+  manualOdoPending = false;
+  periodicOdoInFlight = false;
+  speedValid = false;
+  overspeedActive = false;
+  state = ST_ERROR;
+  uint32_t fifo=0, credits=0;
+  portENTER_CRITICAL(&rxMux);
+  fifo = traceFifoCb;
+  portEXIT_CRITICAL(&rxMux);
+  portENTER_CRITICAL(&creditMux);
+  credits = traceCreditCb;
+  portEXIT_CRITICAL(&creditMux);
+  Serial.printf("RXSAFE STOP reason=%s FIFO=%lu PAR=%lu CR=%lu F912TX=%lu\n",
+                reason, (unsigned long)fifo, (unsigned long)traceParseCount,
+                (unsigned long)credits, (unsigned long)traceF912TxOk);
+  showMessage("TrackBox RX SAFE", String(reason),
+              String("FIFO:")+fifo+" PAR:"+traceParseCount,
+              String("CR:")+credits+" TX:"+traceF912TxOk,
+              "Odczyt STOP");
+}
+
 void onOdometerReadOk()
 {
   // Preserve the F902 polling state and cadence on subsequent F912 reads.
@@ -611,28 +641,12 @@ void onOdometerReadOk()
 
 void speedReadFailed(uint8_t nrc, bool timeout, bool invalid)
 {
-  speedPollingEnabled = false;
-  // Stop counting on lost/invalid F902: we cannot assert >90 km/h
-  // without a current speed measurement. Resume with a new timer
-  // only when a later valid F902 reading again exceeds 90 km/h.
-  overspeedActive = false;
-  overspeedLastShownSec = 0xFFFFFFFFUL;
-  // Only an actual timeout/temporary TX error is retried automatically.
-  // Tachograph NRC (e.g. lack of ITS consent) or invalid values must NOT
-  // be retried in a tight loop. F912 continues independently.
-  speedRetryPending = timeout && nrc == 0 && !invalid;
-  if (speedRetryPending)
-  {
-    speedRetryAt = millis() + SPEED_RETRY_MS;
-    Serial.println("F902 timeout: auto-retry scheduled in 3000 ms");
-  }
-  speedStaleDrawn = false;
   speedValid = false;
   speedLastNrc = nrc;
   speedTimedOut = timeout;
   speedPayloadInvalid = invalid;
-  state = ST_ODOMETER_OK;
-  showSpeedAndOdometer();
+  stopDiagnosticPolling(timeout ? "F902 TIMEOUT" :
+                        invalid ? "F902 INVALID" : "F902 NRC");
 }
 
 void handleSpeedBytes(uint8_t msb, uint8_t lsb)
@@ -1002,71 +1016,41 @@ bool sendStartCommunication()
 // BLE FIFO CALLBACK
 // ============================================================
 
-void fifoCallback(
-  NimBLERemoteCharacteristic* chr,
-  uint8_t* data,
-  size_t length,
-  bool isNotify
-)
+void fifoCallback(NimBLERemoteCharacteristic* chr,
+                  uint8_t* data, size_t length, bool isNotify)
 {
-  if (data == nullptr || length == 0)
-    return;
-
-  if (length > sizeof(rxBuffer))
-    length = sizeof(rxBuffer);
-
+  if (!data || !length) return;
   portENTER_CRITICAL(&rxMux);
-
   traceFifoCb++;
-  memcpy(
-    rxBuffer,
-    data,
-    length
-  );
-
-  rxLength = length;
-
-  rxPending = true;
-
-  // Tachograf zuzywa jeden przyznany
-  // przez nas credit na ten FIFO packet.
-  if (creditsToReturn < 250)
-    creditsToReturn++;
-
+  if (length > RX_MAX_LEN || rxCount >= RX_CAPACITY)
+    rxOverflow = true;
+  else
+  {
+    RxPacket& slot = rxQueue[rxHead];
+    memcpy(slot.data, data, length);
+    slot.len = (uint8_t)length;
+    rxHead = (uint8_t)((rxHead + 1) % RX_CAPACITY);
+    rxCount++;
+  }
   portEXIT_CRITICAL(&rxMux);
 }
-
 
 // ============================================================
 // BLE CREDIT CALLBACK
 // ============================================================
 
-void creditCallback(
-  NimBLERemoteCharacteristic* chr,
-  uint8_t* data,
-  size_t length,
-  bool isNotify
-)
+void creditCallback(NimBLERemoteCharacteristic* chr,
+                    uint8_t* data, size_t length, bool isNotify)
 {
-  if (data == nullptr || length < 1)
-    return;
-
+  if (!data || !length) return;
   portENTER_CRITICAL(&creditMux);
-
   traceCreditCb++;
-  if (data[0] == 0xFF)
-  {
-    creditRejected = true;
-  }
-  else
-  {
-    creditReceived = data[0];
-    creditEvent = true;
-  }
-
+  if (data[0] == 0xFF) creditRejected = true;
+  else if ((uint32_t)creditReceivedPending + data[0] > 255U)
+    creditOverflow = true;
+  else creditReceivedPending += data[0];
   portEXIT_CRITICAL(&creditMux);
 }
-
 
 // ============================================================
 // CLIENT CALLBACKS
@@ -1861,15 +1845,10 @@ void handleKwpFrame(
       return;
     }
 
-    // Ignore negative response to a background F912 request,
-    // keep the existing odometer and uninterrupted speed polling.
+    // A periodic F912 rejection is not retried automatically.
     if (state == ST_WAIT_ODOMETER && periodicOdoInFlight)
     {
-      Serial.printf("F912 periodic NRC=%02X; speed continues\n", nrc);
-      periodicOdoInFlight = false;
-      nextOdoRequestAt = millis() + ODO_RETRY_MS;
-      state = ST_ODOMETER_OK;
-      showSpeedAndOdometer();
+      stopDiagnosticPolling("F912 NRC");
       return;
     }
 
@@ -1932,36 +1911,24 @@ void handleKwpFrame(
 
 void processRx()
 {
-  if (!rxPending)
-    return;
-
-
-  uint8_t local[128];
-
+  uint8_t local[RX_MAX_LEN];
   size_t len = 0;
-
-
+  bool pending = false;
   portENTER_CRITICAL(&rxMux);
-
-  len = rxLength;
-
-  memcpy(
-    local,
-    rxBuffer,
-    len
-  );
-
-  rxPending = false;
-
+  if (rxCount)
+  {
+    const RxPacket& packet = rxQueue[rxTail];
+    len = packet.len;
+    memcpy(local, packet.data, len);
+    rxTail = (uint8_t)((rxTail + 1) % RX_CAPACITY);
+    rxCount--;
+    pending = true;
+  }
   portEXIT_CRITICAL(&rxMux);
+  if (!pending || diagnosticsPaused) return;
 
-
-  // The ITS transport adds packet information before the
-  // application frame. Accept one-packet responses only here.
-  // Leave the raw-data fallback for comparison with prior firmware.
-  if (len >= 3 &&
-      local[0] == 0x01 &&
-      local[1] == 0x01)
+  // Preserve EXACT 23.11 application parsing including raw fallback.
+  if (len >= 3 && local[0] == 0x01 && local[1] == 0x01)
   {
     Serial.println("RX ITS: single packet, remove [01 01]");
     handleKwpFrame(local + 2, len - 2);
@@ -1971,8 +1938,14 @@ void processRx()
     Serial.println("RX ITS: raw or unsupported packet header");
     handleKwpFrame(local, len);
   }
+  // Replenish one credit ONLY after dequeuing and processing the frame.
+  if (!diagnosticsPaused)
+  {
+    portENTER_CRITICAL(&rxMux);
+    if (creditsToReturn < RX_CAPACITY) creditsToReturn++;
+    portEXIT_CRITICAL(&rxMux);
+  }
 }
-
 
 // ============================================================
 // PROCESS CREDIT
@@ -1980,79 +1953,34 @@ void processRx()
 
 void processCredits()
 {
-  bool haveEvent = false;
-
-  uint8_t count = 0;
-
-
+  uint16_t count = 0;
+  bool rejected=false, overflow=false;
   portENTER_CRITICAL(&creditMux);
-
-  if (creditEvent)
-  {
-    haveEvent = true;
-
-    count =
-      creditReceived;
-
-    creditEvent = false;
-  }
-
+  count = creditReceivedPending;
+  creditReceivedPending = 0;
+  rejected = creditRejected;
+  creditRejected = false;
+  overflow = creditOverflow;
+  creditOverflow = false;
   portEXIT_CRITICAL(&creditMux);
-
-
-  if (creditRejected)
+  if (rejected || overflow || (uint32_t)tachoCredits+count > 255U)
   {
-    creditRejected = false;
-
-    Serial.println(
-      "TACHO REJECTED CREDIT CONNECTION"
-    );
-
-    state = ST_ERROR;
-
-    showMessage(
-      "TrackBox G2 ERROR",
-      "Credit = FF",
-      "Tacho rejected"
-    );
-
+    stopDiagnosticPolling(rejected ? "CREDIT REJECT" : "CREDIT OVERFLOW");
     return;
   }
-
-
-  if (haveEvent)
+  if (count && !diagnosticsPaused)
   {
     tachoCredits += count;
-
-
-    Serial.print(
-      "RX Credits from tacho: "
-    );
-
-    Serial.println(count);
-
-
-    Serial.print(
-      "Total tacho credits: "
-    );
-
-    Serial.println(tachoCredits);
-
-
-    if (transportConfigured &&
-        tachoCredits > 0 &&
-        !firstReadSent)
+    Serial.printf("RX credits +%u total %d\n", (unsigned)count, tachoCredits);
+    // Preserve exact 23.11 initial readiness handshake.
+    if (transportConfigured && tachoCredits > 0 && !firstReadSent)
     {
       state = ST_DIAG_READY;
-
-      diagReadyMs =
-        millis();
-
+      diagReadyMs = millis();
       showDiagReady();
     }
   }
 }
-
 
 // ============================================================
 // RETURN CREDIT
@@ -2060,30 +1988,16 @@ void processCredits()
 
 void processCreditReturn()
 {
-  uint8_t count = 0;
-
-
+  if (diagnosticsPaused) return;
+  uint8_t count=0;
   portENTER_CRITICAL(&rxMux);
-
-  if (creditsToReturn > 0)
-  {
-    count =
-      creditsToReturn;
-
-    creditsToReturn = 0;
-  }
-
+  count = creditsToReturn;
+  creditsToReturn = 0;
   portEXIT_CRITICAL(&rxMux);
-
-
-  if (count > 0 &&
-      client != nullptr &&
-      client->isConnected())
-  {
-    giveCreditsToTacho(count);
-  }
+  if (count && client && client->isConnected() &&
+      !giveCreditsToTacho(count))
+    stopDiagnosticPolling("CREDIT TX FAIL");
 }
-
 
 // ============================================================
 // BUTTON
@@ -2129,10 +2043,18 @@ bool startEverything()
   // Jedna proba polaczenia = jeden zestaw licznikow.
   portENTER_CRITICAL(&rxMux);
   traceFifoCb = 0;
+  rxHead = rxTail = rxCount = 0;
+  rxOverflow = false;
+  creditsToReturn = 0;
   portEXIT_CRITICAL(&rxMux);
   portENTER_CRITICAL(&creditMux);
   traceCreditCb = 0;
+  creditReceivedPending = 0;
+  creditOverflow = false;
+  creditRejected = false;
   portEXIT_CRITICAL(&creditMux);
+  disconnected = false;
+  diagnosticsPaused = false;
   traceParseCount = 0;
   traceBadChecksum = 0;
   traceF912TxOk = 0;
@@ -2371,7 +2293,7 @@ void setup()
     "TrackBox G2 F912",
     "LOCALCLOCK 23.11",
     "F90B CLOCK TEST",
-    "BLE ONLY"
+    "RXSAFE 26.17"
   );
   delay(1200);
 
@@ -2463,10 +2385,10 @@ void loop()
   // BLE EVENTS
   // ========================================================
 
+  if (rxOverflow && !diagnosticsPaused)
+    stopDiagnosticPolling("RX QUEUE FULL");
   processCredits();
-
   processRx();
-
   processCreditReturn();
 
   // Update the overspeed clock every second even between F902 responses.
@@ -2493,7 +2415,7 @@ void loop()
   // RETRY F912 PO START COMMUNICATION
   // ========================================================
 
-  if (retryOdometerPending &&
+  if (retryOdometerPending && !diagnosticsPaused &&
       millis() >= retryOdometerAt)
   {
     retryOdometerPending = false;
@@ -2503,7 +2425,7 @@ void loop()
 
 
   // Poll F902 only after successful F912. Never overlap queries.
-  if (manualOdoPending && state == ST_ODOMETER_OK &&
+  if (manualOdoPending && !diagnosticsPaused && state == ST_ODOMETER_OK &&
       client != nullptr && client->isConnected() && tachoCredits > 0)
   {
     manualOdoPending = false;
@@ -2511,27 +2433,10 @@ void loop()
     firstReadSent = true;
     sendOdometerRequest();
   }
-  // Restore only the F902 polling state 3 seconds after a timeout.
-  // F912 continues throughout the pause. Do not overlap outstanding
-  // diagnostic requests, and do not restart BLE or StartCommunication.
-  if (speedRetryPending &&
-      (int32_t)(millis() - speedRetryAt) >= 0 &&
-      hasOdometer && state == ST_ODOMETER_OK &&
-      !manualOdoPending &&
-      client != nullptr && client->isConnected() &&
-      tachoCredits > 0)
-  {
-    speedRetryPending = false;
-    speedPollingEnabled = true;
-    speedRetryAttempts++;
-    Serial.printf("F902 auto-retry attempt #%lu\n",
-                  (unsigned long)speedRetryAttempts);
-    sendSpeedRequest();
-  }
-
+  // No automatic F902 retries: stop all diagnostic TX after a failure.
   // Clock requests are optional and run between F912 and F902 polling.
   // A failure affects only the clock; never the established data session.
-  if (hasOdometer && state == ST_ODOMETER_OK &&
+  if (hasOdometer && !diagnosticsPaused && state == ST_ODOMETER_OK &&
       nextTimeSyncAtMs != 0 &&
       !manualOdoPending && tachoCredits > 0 &&
       (int32_t)(millis() - nextTimeSyncAtMs) >= 0)
@@ -2542,7 +2447,7 @@ void loop()
   if (state == ST_WAIT_TIME &&
       (uint32_t)(millis() - requestStartMs) > TIME_TIMEOUT_MS)
   {
-    timeSyncFailed("timeout waiting for F90B");
+    stopDiagnosticPolling("F90B TIMEOUT");
   }
 
   // Update the clock only when local HH:MM changes; speed redraws may
@@ -2552,7 +2457,7 @@ void loop()
 
   // Service a due odometer request ahead of the next speed query.
   // One diagnostic request in flight at any time.
-  if (hasOdometer && !manualOdoPending &&
+  if (hasOdometer && !manualOdoPending && !diagnosticsPaused &&
       state == ST_ODOMETER_OK &&
       client != nullptr && client->isConnected() &&
       tachoCredits > 0 &&
@@ -2567,6 +2472,7 @@ void loop()
   }
 
   if (state == ST_ODOMETER_OK && speedPollingEnabled &&
+      !diagnosticsPaused &&
       !manualOdoPending && tachoCredits > 0 &&
       (int32_t)(millis() - nextSpeedRequestAt) >= 0)
   {
@@ -2593,45 +2499,21 @@ void loop()
   // ========================================================
 
   if (state == ST_WAIT_ODOMETER &&
-      millis() - requestStartMs > 1500)
+      (uint32_t)(millis()-requestStartMs) >
+        (hasOdometer ? ODO_PERIODIC_TIMEOUT_MS : 1500UL))
   {
-    if (periodicOdoInFlight)
-    {
-      // Skip only the failed background F912, without a disruptive
-      // StartCommunication fallback, preserving the speed session.
-      periodicOdoInFlight = false;
-      nextOdoRequestAt = millis() + ODO_RETRY_MS;
-      state = ST_ODOMETER_OK;
-      Serial.println("F912 periodic timeout; speed continues");
-      showSpeedAndOdometer();
-    }
+    if (hasOdometer)
+      stopDiagnosticPolling("F912 TIMEOUT");
     else if (!fallbackStartCommUsed)
     {
+      // Original 23.11 one-time startup fallback (not invoked in background).
       fallbackStartCommUsed = true;
-
-      Serial.println(
-        "F912 timeout -> trying StartCommunication"
-      );
-
+      Serial.println("F912 startup timeout -> StartCommunication");
       sendStartCommunication();
     }
     else
-    {
-      state = ST_ERROR;
-
-      showMessage(
-        "TrackBox G2 ERROR",
-        "F912 timeout",
-        "brak odpowiedzi",
-        "CONFIRM=retry"
-      );
-
-      Serial.println(
-        "F912: NO RESPONSE"
-      );
-    }
+      stopDiagnosticPolling("FIRST F912");
   }
-
 
   // ========================================================
   // TIMEOUT START COMM
