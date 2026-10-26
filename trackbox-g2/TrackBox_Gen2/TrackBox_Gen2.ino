@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.14-F912-DIAGTEST";
+  "2026.10.26.15-CREDIT32-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -254,8 +254,9 @@ portMUX_TYPE rxMux =
   portMUX_INITIALIZER_UNLOCKED;
 
 // Per JRC/CORTE ITS §4.2.3, receiving buffers MUST match grants.
-// Four slots, four initial credits; return one credit only after processing.
-static const uint8_t RX_QUEUE_SIZE = 4;
+// 32 slots, 32 initial credits (proven working in 23.11/26.12).
+// Credit is returned only after its corresponding packet is processed.
+static const uint8_t RX_QUEUE_SIZE = 32;
 static const size_t RX_MAX_PACKET = 128;
 struct RxFrame { uint8_t bytes[RX_MAX_PACKET]; uint8_t length; };
 RxFrame rxQueue[RX_QUEUE_SIZE];
@@ -1514,7 +1515,7 @@ bool setupDiagnosticTransport()
 
 
   // ========================================================
-  // GIVE EXACTLY FOUR CREDITS FOR FOUR PHYSICAL RX SLOTS
+  // GIVE 32 CREDITS FOR 32 PHYSICAL RX QUEUE SLOTS
   // ========================================================
 
   delay(100);
@@ -2316,7 +2317,7 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "F912 DIAG 26.14",
+    "CREDIT32 26.15",
     "CREDIT/RX TEST",
     "BLE ONLY"
   );
