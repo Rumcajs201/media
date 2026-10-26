@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.13-RXFLOW-SAFETEST";
+  "2026.10.26.14-F912-DIAGTEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -209,6 +209,7 @@ static const uint32_t SPEED_STALE_MS = 3500;
 // Automatic F912 refresh: 2-second cadence without interrupting F902.
 // On periodic failure retry later; never send StartCommunication as fallback.
 static const uint32_t ODO_POLL_MS = 15000;
+static const uint32_t ODO_TIMEOUT_MS = 5000UL; // initial and periodic F912 response watchdog
 static const uint32_t ODO_RETRY_MS = 6000;
 uint32_t nextOdoRequestAt = 0;
 bool periodicOdoInFlight = false;
@@ -2315,7 +2316,7 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "RXFLOW SAFE 26.13",
+    "F912 DIAG 26.14",
     "CREDIT/RX TEST",
     "BLE ONLY"
   );
@@ -2530,9 +2531,31 @@ void loop()
   // ========================================================
 
   if (state == ST_WAIT_ODOMETER &&
-      millis() - requestStartMs > 1500)
+      (uint32_t)(millis() - requestStartMs) > ODO_TIMEOUT_MS)
   {
+    // Important: distinguish no response from parsed/ignored frames.
+    // Keep all TX stopped after the first failed request.
+    uint32_t fifoSeen = 0;
+    uint32_t creditsSeen = 0;
+    portENTER_CRITICAL(&rxMux);
+    fifoSeen = traceFifoCb;
+    portEXIT_CRITICAL(&rxMux);
+    portENTER_CRITICAL(&creditMux);
+    creditsSeen = traceCreditCb;
+    portEXIT_CRITICAL(&creditMux);
+    const uint32_t framesParsed = traceParseCount;
     haltDiagnostics("F912 TIMEOUT");
+    showMessage(
+      "F912 TIMEOUT",
+      String("FIFO:") + fifoSeen + " PAR:" + framesParsed,
+      String("CR:") + creditsSeen + " AV:" + tachoCredits,
+      String("F912 TX:") + traceF912TxOk,
+      "STOP / BACK"
+    );
+    Serial.printf("F912 timeout RX fifo=%lu parsed=%lu credit_cb=%lu available=%d TX=%lu\\n",
+                  (unsigned long)fifoSeen, (unsigned long)framesParsed,
+                  (unsigned long)creditsSeen, tachoCredits,
+                  (unsigned long)traceF912TxOk);
   }
 
 
