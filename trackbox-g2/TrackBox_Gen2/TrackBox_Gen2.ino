@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.18-23_11-RXSAFE-TEST";
+  "2026.10.26.19-CREDITACCUM-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -265,7 +265,9 @@ volatile uint8_t creditsToReturn = 0;
 portMUX_TYPE creditMux =
   portMUX_INITIALIZER_UNLOCKED;
 
-volatile uint16_t creditReceivedPending = 0;
+// Credit indication value is one byte, but aggregate credit balance is
+// additive and need not stay within 0..255 (JRC/CORTE ITS section 4.2.3).
+volatile uint32_t creditReceivedPending = 0;
 volatile bool creditOverflow = false;
 volatile bool creditRejected = false;
 
@@ -1046,7 +1048,7 @@ void creditCallback(NimBLERemoteCharacteristic* chr,
   portENTER_CRITICAL(&creditMux);
   traceCreditCb++;
   if (data[0] == 0xFF) creditRejected = true;
-  else if ((uint32_t)creditReceivedPending + data[0] > 255U)
+  else if (creditReceivedPending > 2147483647UL - (uint32_t)data[0])
     creditOverflow = true;
   else creditReceivedPending += data[0];
   portEXIT_CRITICAL(&creditMux);
@@ -1953,7 +1955,7 @@ void processRx()
 
 void processCredits()
 {
-  uint16_t count = 0;
+  uint32_t count = 0;
   bool rejected=false, overflow=false;
   portENTER_CRITICAL(&creditMux);
   count = creditReceivedPending;
@@ -1963,7 +1965,10 @@ void processCredits()
   overflow = creditOverflow;
   creditOverflow = false;
   portEXIT_CRITICAL(&creditMux);
-  if (rejected || overflow || (uint32_t)tachoCredits+count > 255U)
+  // Only a genuine signed 32-bit counter overflow is an error.
+  // Previously the cumulative balance was incorrectly capped at 255.
+  if (rejected || overflow || tachoCredits < 0 ||
+      count > (2147483647UL - (uint32_t)tachoCredits))
   {
     stopDiagnosticPolling(rejected ? "CREDIT REJECT" : "CREDIT OVERFLOW");
     return;
@@ -1971,7 +1976,7 @@ void processCredits()
   if (count && !diagnosticsPaused)
   {
     tachoCredits += count;
-    Serial.printf("RX credits +%u total %d\n", (unsigned)count, tachoCredits);
+    Serial.printf("RX credits +%lu total %d\n", (unsigned long)count, tachoCredits);
     // Preserve exact 23.11 initial readiness handshake.
     if (transportConfigured && tachoCredits > 0 && !firstReadSent)
     {
@@ -2293,7 +2298,7 @@ void setup()
     "TrackBox G2 F912",
     "LOCALCLOCK 23.11",
     "F90B CLOCK TEST",
-    "RXSAFE 26.17"
+    "RXSAFE 26.19"
   );
   delay(1200);
 
