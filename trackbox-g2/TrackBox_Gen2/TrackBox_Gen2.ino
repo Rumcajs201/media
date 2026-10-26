@@ -2417,8 +2417,8 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2 F912",
-    "LOCALCLOCK 23.11",
-    "F90B CLOCK TEST",
+    "BLEGUARD 26.12",
+    "BLE DIAG TEST",
     "BLE ONLY"
   );
   delay(1200);
