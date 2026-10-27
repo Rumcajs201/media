@@ -637,7 +637,7 @@ void showSpeedAndOdometer()
   oled.drawHLine(0, 37, 128);
 
   // Existing F912 conversion and precision, no units or value changes.
-  oled.setCursor(0, 49);
+  oled.setCursor(0, 48);
   if (hasOdometer)
     oled.print(odometerKm, 1);
   else
@@ -645,7 +645,7 @@ void showSpeedAndOdometer()
   oled.print(" km");
 
   // START left; J daily driving time in a larger bold 7x14 right-hand area.
-  // 7x14 at y=63 starts below odometer's bottom row (y=49).
+  // 7x14 baseline y=60 leaves room for font descenders; ODO ends at y=48.
   oled.setFont(u8g2_font_5x7_tf);
   oled.setCursor(0, 61);
   oled.print("Start:");
@@ -660,7 +660,7 @@ void showSpeedAndOdometer()
     snprintf(driveText, sizeof(driveText), "J:--:--");
   oled.setFont(u8g2_font_7x14B_tf);
   const int16_t driveWidth = oled.getStrWidth(driveText);
-  oled.drawStr(128 - driveWidth, 63, driveText);
+  oled.drawStr(128 - driveWidth, 60, driveText);
 
   oled.sendBuffer();
 }
