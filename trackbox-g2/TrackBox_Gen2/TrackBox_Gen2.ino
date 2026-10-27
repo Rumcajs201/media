@@ -1227,7 +1227,8 @@ bool sendRestProbeRequest(bool manual)
                     0x03, SID_READ_DATA, 0xF9, 0x97, 0};
   msg[7] = kwpChecksum(msg, 7);
   restManualInFlight = manual;
-  if (!manual) restAutoAttempted = true;
+  // A manual read performed after F90B sync also satisfies the one-shot read.
+  if (!manual || clockValid) restAutoAttempted = true;
   if (!sendDiagPacket(msg, sizeof(msg)))
   {
     Serial.println("F997 one-shot TX failed");
