@@ -2768,10 +2768,10 @@ void setup()
   // Diagnostic build identity shown before executing the exact F912 sequence.
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
-    "TrackBox G2 F912",
-    "LOCALCLOCK 23.11",
-    "F90B CLOCK TEST",
-    "DAILY 5MIN 27.01"
+    "TrackBox G2",
+    "START UI 27.05",
+    "F90B/F99A/F997",
+    "BLE TEST"
   );
   delay(1200);
 
