@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.26.22-F902TRACE-TEST";
+  "2026.10.27.01-DAILY5MIN-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -135,6 +135,7 @@ enum State
   ST_ODOMETER_OK,
   ST_WAIT_SPEED,
   ST_WAIT_TIME,
+  ST_WAIT_DAILY,
   ST_ERROR
 };
 
@@ -221,6 +222,19 @@ float speedKmh = 0.0f;
 uint32_t speedLastOkMs = 0;
 uint32_t nextSpeedRequestAt = 0;
 uint32_t speedReplies = 0;
+
+// Optional ISO 16844-7 DID F99A: driver 1 current daily driving minutes.
+// Poll ONLY while a fresh tachograph speed sample is > 0 km/h;
+// never more than once in 5 minutes and never while other DID is in flight.
+// If unsupported, refused or timed out, disable F99A for this BLE session.
+static const uint32_t DAILY_DRIVE_POLL_MS = 300000UL;
+static const uint32_t DAILY_DRIVE_TIMEOUT_MS = 3500UL;
+bool dailyDriveEnabled = true;
+bool dailyDriveValid = false;
+uint16_t dailyDriveMinutes = 0;
+uint32_t nextDailyDriveAtMs = 0;
+uint32_t dailyDriveTxCount = 0;
+uint32_t dailyDriveRxCount = 0;
 
 // Passive F902 diagnosis: no additional requests, and no automatic retry.
 // Only F902 TIMEOUT uses a 1.5 s receive-only grace period before clean BLE close.
@@ -600,9 +614,28 @@ void showSpeedAndOdometer()
     oled.print("------.-");
   oled.print(" km");
 
-  // The cached text changes only on a minute boundary.
-  oled.setFont(u8g2_font_7x14B_tf);
-  oled.drawStr(90, 63, clockText);
+  // Compact right-hand clock is above the speed and never overlaps
+  // the 94-pixel-wide maximum speed field.
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(102, 8, clockText);
+
+  // Extra bottom line. A true daily-work start timestamp is NOT available
+  // from the DIDs verified on this specific SE5000, so leave it unknown.
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.setCursor(0, 61);
+  oled.print("Start:--:--");
+  oled.setCursor(70, 61);
+  oled.print("J:");
+  if (dailyDriveValid)
+  {
+    char dailyText[12];
+    snprintf(dailyText, sizeof(dailyText), "%02u:%02u",
+             (unsigned)(dailyDriveMinutes / 60U),
+             (unsigned)(dailyDriveMinutes % 60U));
+    oled.print(dailyText);
+  }
+  else
+    oled.print("--:--");
   oled.sendBuffer();
 }
 
@@ -682,6 +715,44 @@ void stopDiagnosticPolling(const char* reason)
               String("FIFO:")+fifoFrames+" PAR:"+traceParseCount,
               String("CR:")+creditEvents+" TX:"+traceF912TxOk,
               "STOP / BACK");
+}
+
+// Optional F99A failures must never take down working F902/F912 reads.
+void dailyDriveUnavailable(const char* reason)
+{
+  Serial.printf("Optional F99A disabled for session: %s\\n", reason);
+  dailyDriveEnabled = false;
+  dailyDriveValid = false;
+  // Re-establish idle state without sending an automatic retry.
+  state = ST_ODOMETER_OK;
+  // Wait before regular F902 to let any late F99A data arrive and be ignored.
+  nextSpeedRequestAt = millis() + 3000UL;
+  if (!overspeedActive) showSpeedAndOdometer();
+}
+
+void dailyDriveReply(uint8_t hi, uint8_t lo)
+{
+  if (state != ST_WAIT_DAILY)
+  {
+    Serial.println("Late F99A ignored");
+    return;
+  }
+  const uint16_t raw = ((uint16_t)hi << 8) | lo; // 1 minute / bit
+  // 0xFB00..0xFFFF are special/invalid numerical indications.
+  if (raw >= 0xFB00U)
+  {
+    dailyDriveUnavailable("F99A special value");
+    return;
+  }
+  dailyDriveMinutes = raw;
+  dailyDriveValid = true;
+  dailyDriveRxCount++;
+  state = ST_ODOMETER_OK;
+  Serial.printf("F99A daily drive=%u min (%u:%02u) TX=%lu OK=%lu\\n",
+                (unsigned)raw, (unsigned)(raw/60U), (unsigned)(raw%60U),
+                (unsigned long)dailyDriveTxCount,
+                (unsigned long)dailyDriveRxCount);
+  showSpeedAndOdometer();
 }
 
 void onOdometerReadOk()
@@ -1000,6 +1071,34 @@ bool sendOdometerRequest()
 // F902 TVS: same proven single-packet KWP/ITS transport.
 // Frame: 80 EE F0 03 22 F9 02 CS, ITS prefix [01 01].
 // ============================================================
+// Optional F99A RDBI. Same proven KWP/ITS [01 01] outgoing framing.
+bool sendDailyDriveRequest()
+{
+  if (diagnosticsPaused || !dailyDriveEnabled || !hasOdometer ||
+      state != ST_ODOMETER_OK || tachoCredits <= 0 ||
+      !speedValid || speedRaw == 0 ||
+      (uint32_t)(millis() - speedLastOkMs) > SPEED_STALE_MS)
+    return false;
+
+  uint8_t msg[8] = {0x80, VU_ADDRESS, TESTER_ADDRESS,
+                    0x03, SID_READ_DATA, 0xF9, 0x9A, 0};
+  msg[7] = kwpChecksum(msg, 7);
+  // Set next eligibility BEFORE sending: at most 1 per 5 minutes.
+  nextDailyDriveAtMs = millis() + DAILY_DRIVE_POLL_MS;
+  if (!sendDiagPacket(msg, sizeof(msg)))
+  {
+    dailyDriveEnabled = false; // never retry optional traffic
+    Serial.println("F99A TX failed - disabling optional reads");
+    return false;
+  }
+  state = ST_WAIT_DAILY;
+  requestStartMs = millis();
+  dailyDriveTxCount++;
+  Serial.printf("F99A daily-driving-time request %lu\\n",
+                (unsigned long)dailyDriveTxCount);
+  return true;
+}
+
 bool sendSpeedRequest()
 {
   if (!hasOdometer || !speedPollingEnabled ||
@@ -1702,6 +1801,22 @@ void handleKwpFrame(
   }
 
 
+  // Optional RAW UDS positive: 62 F9 9A [daily minutes MSB LSB].
+  if (length >= 5 && data[0] == SID_READ_DATA_POS &&
+      data[1] == 0xF9 && data[2] == 0x9A)
+  {
+    dailyDriveReply(data[3], data[4]);
+    return;
+  }
+
+  // RAW UDS negative when optional F99A was requested.
+  if (state == ST_WAIT_DAILY && length >= 3 &&
+      data[0] == SID_NEGATIVE && data[1] == SID_READ_DATA)
+  {
+    dailyDriveUnavailable("F99A NRC");
+    return;
+  }
+
   // RAW UDS positive: 62 F9 0B [8-byte TimeDate].
   if (length >= 11 && data[0] == SID_READ_DATA_POS &&
       data[1] == 0xF9 && data[2] == 0x0B)
@@ -1791,6 +1906,15 @@ void handleKwpFrame(
 
 
   uint8_t sid = data[4];
+
+  // Optional positive F99A KWP: 80 tgt src 05 62 F9 9A HI LO CS.
+  // Checked KWP checksum and address format above, as for F902.
+  if (sid == SID_READ_DATA_POS && length >= 10 &&
+      data[5] == 0xF9 && data[6] == 0x9A)
+  {
+    dailyDriveReply(data[7], data[8]);
+    return;
+  }
 
   // Positive F90B KWP: 80 tgt src 0B 62 F9 0B [8 bytes] CS.
   if (sid == SID_READ_DATA_POS && length >= 16 &&
@@ -1962,6 +2086,14 @@ void handleKwpFrame(
       nrc
     );
 
+
+    // F99A is optional and requires driver consent. A refusal must not
+    // interrupt the tachograph speed/odometer session.
+    if (state == ST_WAIT_DAILY)
+    {
+      dailyDriveUnavailable("F99A refused / consent");
+      return;
+    }
 
     // F90B is optional; if unsupported, do not disturb F902 or F912.
     if (state == ST_WAIT_TIME)
@@ -2209,6 +2341,11 @@ bool startEverything()
   speedLastOkMs = 0;
   nextSpeedRequestAt = 0;
   speedReplies = 0;
+  dailyDriveEnabled = true;
+  dailyDriveValid = false;
+  dailyDriveMinutes = 0;
+  nextDailyDriveAtMs = 0;
+  dailyDriveTxCount = dailyDriveRxCount = 0;
   speedRetryPending = false;
   speedRetryAt = 0;
   speedRetryAttempts = 0;
@@ -2434,7 +2571,7 @@ void setup()
     "TrackBox G2 F912",
     "LOCALCLOCK 23.11",
     "F90B CLOCK TEST",
-    "F902 TRACE 26.22"
+    "DAILY 5MIN 27.01"
   );
   delay(1200);
 
@@ -2633,6 +2770,24 @@ void loop()
     {
       stopDiagnosticPolling("F912 TX FAIL");
     }
+  }
+
+  // Read optional F99A only when we have a fresh nonzero speed.
+  // Place between existing F912 refresh and F902; no two queries overlap.
+  // On standstill (raw speed 0), never request daily-driving time.
+  if (hasOdometer && dailyDriveEnabled && !diagnosticsPaused &&
+      state == ST_ODOMETER_OK && speedValid && speedRaw > 0 &&
+      (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS &&
+      tachoCredits > 0 &&
+      (int32_t)(millis() - nextDailyDriveAtMs) >= 0)
+  {
+    sendDailyDriveRequest();
+  }
+
+  if (!diagnosticsPaused && state == ST_WAIT_DAILY &&
+      (uint32_t)(millis() - requestStartMs) > DAILY_DRIVE_TIMEOUT_MS)
+  {
+    dailyDriveUnavailable("F99A timeout"); // no retry or BLE reset
   }
 
   if (state == ST_ODOMETER_OK && speedPollingEnabled &&
