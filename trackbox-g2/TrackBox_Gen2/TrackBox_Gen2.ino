@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.27.03-F997-STARTDISPLAY-TEST";
+  "2026.10.27.04-F997-MANUAL-BLE-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -237,17 +237,11 @@ uint32_t nextDailyDriveAtMs = 0;
 uint32_t dailyDriveTxCount = 0;
 uint32_t dailyDriveRxCount = 0;
 
-// F997 is END OF LAST DAILY REST, a proxy for START, not a manual start record.
-// Once per BLE session, after F90B sync and a fresh zero speed, query F997.
-// The PUSH button retains its manual test function. No cyclic F997 polling.
+// F997 is END OF LAST DAILY REST, not the actual start of work.
+// Manual one-shot only: encoder PUSH while stationary, no automatic polling.
 static const uint32_t REST_PROBE_TIMEOUT_MS = 3500UL;
-static const time_t REST_MAX_AGE_SEC = 18L * 3600L; // conservative freshness guard
 uint32_t restProbeDisplayUntilMs = 0;
-bool restProbePending = false; // remember PUSH while another DID is in flight
-bool restAutoAttempted = false;
-bool restManualInFlight = false;
-bool restStartValid = false;
-char restStartLocalText[6] = "--:--";
+bool restProbePending = false; // remember a button press while F902/F912 is in flight
 
 // Passive F902 diagnosis: no additional requests, and no automatic retry.
 // Only F902 TIMEOUT uses a 1.5 s receive-only grace period before clean BLE close.
@@ -638,12 +632,11 @@ void showSpeedAndOdometer()
   oled.setFont(u8g2_font_5x7_tf);
   oled.drawStr(102, 8, clockText);
 
-  // F997 rest-end proxy for work start; unknown when missing, stale or refused.
-  // Not the separate manually entered work-start record from the driver card.
+  // Extra bottom line. A true daily-work start timestamp is NOT available
+  // from the DIDs verified on this specific SE5000, so leave it unknown.
   oled.setFont(u8g2_font_5x7_tf);
   oled.setCursor(0, 61);
-  oled.print("Start:");
-  oled.print(restStartValid ? restStartLocalText : "--:--");
+  oled.print("Start:--:--");
   oled.setCursor(70, 61);
   oled.print("J:");
   if (dailyDriveValid)
@@ -757,15 +750,8 @@ void finishRestProbe(const char* header, const String& line1,
                      const String& line4)
 {
   state = ST_ODOMETER_OK;
-  if (restManualInFlight)
-  {
-    restProbeDisplayUntilMs = millis() + 15000UL;
-    showMessage(header, line1, line2, line3, line4);
-  }
-  else if (!diagnosticsPaused)
-  {
-    showSpeedAndOdometer();
-  }
+  restProbeDisplayUntilMs = millis() + 15000UL;
+  showMessage(header, line1, line2, line3, line4);
 }
 
 void restProbeReply(const uint8_t* bytes)
@@ -820,29 +806,8 @@ void restProbeReply(const uint8_t* bytes)
       year, month, day, hour, minute, sec,
       localRest.tm_year+1900, localRest.tm_mon+1, localRest.tm_mday,
       localRest.tm_hour, localRest.tm_min);
-
-  // The clock MUST be synchronized from F90B. A stale F997 date must never
-  // appear as today's START (e.g. powering the unit before a new shift).
-  const time_t nowUTC = time(nullptr);
-  const int64_t age = (int64_t)nowUTC - (int64_t)utcEpoch;
-  if (clockValid && age >= 0 && age <= (int64_t)REST_MAX_AGE_SEC)
-  {
-    snprintf(restStartLocalText, sizeof(restStartLocalText), "%02d:%02d",
-             localRest.tm_hour, localRest.tm_min);
-    restStartValid = true;
-    Serial.printf("F997 START proxy accepted: %s, age %lld seconds\\n",
-                  restStartLocalText, (long long)age);
-  }
-  else
-  {
-    restStartValid = false;
-    strcpy(restStartLocalText, "--:--");
-    Serial.printf("F997 START proxy rejected: clockValid=%d age=%lld seconds\\n",
-                  (int)clockValid, (long long)age);
-  }
   finishRestProbe("F997 KONIEC REST", utcText, localText,
-                  restStartValid ? "START~F997 OK" : "ZBYT STARE/BEZ CLK",
-                  "PUSH=powtorz");
+                  "TO NIE START!", "PUSH=powtorz");
 }
 
 void dailyDriveReply(uint8_t hi, uint8_t lo)
@@ -1214,9 +1179,9 @@ bool sendDailyDriveRequest()
   return true;
 }
 
-// One-shot F997 request, only while stopped. Auto: once per BLE session.
-// Manual: PUSH. Existing [01 01] KWP/ITS transport and flow-control.
-bool sendRestProbeRequest(bool manual)
+// One-shot F997 request, only while stopped, on physical encoder PUSH.
+// It uses the established [01 01] KWP/ITS path and the same flow-control.
+bool sendRestProbeRequest()
 {
   if (diagnosticsPaused || !hasOdometer || state != ST_ODOMETER_OK ||
       tachoCredits <= 0 || client == nullptr || !client->isConnected() ||
@@ -1226,9 +1191,6 @@ bool sendRestProbeRequest(bool manual)
   uint8_t msg[8] = {0x80, VU_ADDRESS, TESTER_ADDRESS,
                     0x03, SID_READ_DATA, 0xF9, 0x97, 0};
   msg[7] = kwpChecksum(msg, 7);
-  restManualInFlight = manual;
-  // A manual read performed after F90B sync also satisfies the one-shot read.
-  if (!manual || clockValid) restAutoAttempted = true;
   if (!sendDiagPacket(msg, sizeof(msg)))
   {
     Serial.println("F997 one-shot TX failed");
@@ -1238,14 +1200,10 @@ bool sendRestProbeRequest(bool manual)
   }
   state = ST_WAIT_REST;
   requestStartMs = millis();
-  if (manual)
-  {
-    restProbeDisplayUntilMs = millis() + 15000UL;
-    showMessage("F997 REST TEST", "Czytam 1 raz...",
-                "Tylko na postoju", "START bez zmian", "");
-  }
-  Serial.printf("F997 one-shot sent (%s), rest end (not verified manual work start)\\n",
-                manual ? "MANUAL" : "AUTO");
+  restProbeDisplayUntilMs = millis() + 15000UL;
+  showMessage("F997 REST TEST", "Czytam 1 raz...",
+              "Tylko na postoju", "START bez zmian", "");
+  Serial.println("F997 one-shot sent (last daily rest end, NOT work start)");
   return true;
 }
 
@@ -2534,10 +2492,6 @@ bool startEverything()
   dailyDriveTxCount = dailyDriveRxCount = 0;
   restProbeDisplayUntilMs = 0;
   restProbePending = false;
-  restAutoAttempted = false;
-  restManualInFlight = false;
-  restStartValid = false;
-  strcpy(restStartLocalText, "--:--");
   speedRetryPending = false;
   speedRetryAt = 0;
   speedRetryAttempts = 0;
@@ -2865,7 +2819,7 @@ void loop()
   if (restProbePending && !diagnosticsPaused && state == ST_ODOMETER_OK)
   {
     restProbePending = false;
-    sendRestProbeRequest(true); // validates a fresh standstill once more
+    sendRestProbeRequest(); // validates a fresh standstill once more
   }
 
   // Finish F902 receive-only grace after timeout, with zero additional
@@ -2963,19 +2917,6 @@ void loop()
   if (!overspeedActive && hasOdometer && !diagnosticsPaused &&
       refreshClockText())
     showSpeedAndOdometer();
-
-  // ONE automatic F997 after tachograph clock F90B sync, at standstill.
-  // Wait for an idle slot; do not alter the F902/F912/F99A schedules.
-  // On failure or stale date, leave Start:--:--; PUSH allows manual retry.
-  if (!restAutoAttempted && clockValid && !diagnosticsPaused &&
-      hasOdometer && !manualOdoPending &&
-      state == ST_ODOMETER_OK && tachoCredits > 0 &&
-      client != nullptr && client->isConnected() &&
-      speedValid && speedRaw == 0 &&
-      (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS)
-  {
-    sendRestProbeRequest(false);
-  }
 
   // Service a due odometer request ahead of the next speed query.
   // One diagnostic request in flight at any time.
