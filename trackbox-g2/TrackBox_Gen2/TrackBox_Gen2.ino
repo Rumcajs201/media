@@ -241,6 +241,7 @@ uint32_t dailyDriveRxCount = 0;
 // Manual one-shot only: encoder PUSH while stationary, no automatic polling.
 static const uint32_t REST_PROBE_TIMEOUT_MS = 3500UL;
 uint32_t restProbeDisplayUntilMs = 0;
+bool restProbePending = false; // remember a button press while F902/F912 is in flight
 
 // Passive F902 diagnosis: no additional requests, and no automatic retry.
 // Only F902 TIMEOUT uses a 1.5 s receive-only grace period before clean BLE close.
@@ -2490,6 +2491,7 @@ bool startEverything()
   nextDailyDriveAtMs = 0;
   dailyDriveTxCount = dailyDriveRxCount = 0;
   restProbeDisplayUntilMs = 0;
+  restProbePending = false;
   speedRetryPending = false;
   speedRetryAt = 0;
   speedRetryAttempts = 0;
@@ -2813,6 +2815,13 @@ void loop()
   processRx();
   processCreditReturn();
 
+  // Run a queued manual F997 test only between other diagnostic requests.
+  if (restProbePending && !diagnosticsPaused && state == ST_ODOMETER_OK)
+  {
+    restProbePending = false;
+    sendRestProbeRequest(); // validates a fresh standstill once more
+  }
+
   // Finish F902 receive-only grace after timeout, with zero additional
   // diagnostic requests. Display final counters including late arrivals.
   if (diagnosticsPaused && f902GraceUntilMs != 0 &&
@@ -3075,8 +3084,11 @@ void loop()
 
   // Encoder PUSH is otherwise unused during normal running.
   // Send exactly one F997 only on a fresh zero-speed tachograph reading.
-  if (pressed(PIN_ENC_PUSH, lastEncoderPush, encoderPushChangeMs))
-    sendRestProbeRequest();
+  if (pressed(PIN_ENC_PUSH, lastEncoderPush, encoderPushChangeMs) &&
+      !diagnosticsPaused && hasOdometer && speedValid && speedRaw == 0 &&
+      (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS &&
+      client != nullptr && client->isConnected())
+    restProbePending = true;
 
   if (pressed(
         PIN_CONFIRM,
