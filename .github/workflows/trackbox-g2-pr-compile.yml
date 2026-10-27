@@ -1,0 +1,37 @@
+name: TrackBox G2 PR compile (no OTA publication)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "trackbox-g2/TrackBox_Gen2/**"
+      - ".github/workflows/trackbox-g2-pr-compile.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compile-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.7 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+      - name: Install libraries
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "U8g2"
+          arduino-cli lib install "NimBLE-Arduino@2.5.1"
+      - name: Compile diagnostic prototype
+        run: |
+          arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" --output-dir build trackbox-g2/TrackBox_Gen2
+      - name: Upload BIN for manual test (never overwrite latest.bin)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackBox_G2_F997_ONE_SHOT_TEST
+          path: build/*.ino.bin
+          retention-days: 14
