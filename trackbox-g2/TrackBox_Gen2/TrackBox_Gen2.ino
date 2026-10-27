@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.27.01-DAILY5MIN-TEST";
+  "2026.10.27.02-F997-ONE-SHOT-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -136,6 +136,7 @@ enum State
   ST_WAIT_SPEED,
   ST_WAIT_TIME,
   ST_WAIT_DAILY,
+  ST_WAIT_REST,
   ST_ERROR
 };
 
@@ -236,6 +237,12 @@ uint32_t nextDailyDriveAtMs = 0;
 uint32_t dailyDriveTxCount = 0;
 uint32_t dailyDriveRxCount = 0;
 
+// F997 is END OF LAST DAILY REST, not the actual start of work.
+// Manual one-shot only: encoder PUSH while stationary, no automatic polling.
+static const uint32_t REST_PROBE_TIMEOUT_MS = 3500UL;
+uint32_t restProbeDisplayUntilMs = 0;
+bool restProbePending = false; // remember a button press while F902/F912 is in flight
+
 // Passive F902 diagnosis: no additional requests, and no automatic retry.
 // Only F902 TIMEOUT uses a 1.5 s receive-only grace period before clean BLE close.
 static const uint32_t F902_PASSIVE_GRACE_MS = 1500UL;
@@ -333,9 +340,11 @@ const uint32_t DEBOUNCE_MS = 40;
 
 bool lastConfirm = HIGH;
 bool lastBack = HIGH;
+bool lastEncoderPush = HIGH;
 
 uint32_t confirmChangeMs = 0;
 uint32_t backChangeMs = 0;
+uint32_t encoderPushChangeMs = 0;
 
 
 // ============================================================
@@ -580,6 +589,10 @@ void showOverspeedSeconds()
 // available on errors/Serial but are hidden in the driving view.
 void showSpeedAndOdometer()
 {
+  // Preserve the diagnostic screen for 15s while BLE parsing continues.
+  if (restProbeDisplayUntilMs != 0 &&
+      (int32_t)(millis() - restProbeDisplayUntilMs) < 0)
+    return;
   if (overspeedActive)
   {
     showOverspeedSeconds();
@@ -728,6 +741,73 @@ void dailyDriveUnavailable(const char* reason)
   // Wait before regular F902 to let any late F99A data arrive and be ignored.
   nextSpeedRequestAt = millis() + 3000UL;
   if (!overspeedActive) showSpeedAndOdometer();
+}
+
+// F997 is a read-only, optional DID. Show its data separately from START.
+// The normal driving dashboard is never populated with this timestamp.
+void finishRestProbe(const char* header, const String& line1,
+                     const String& line2, const String& line3,
+                     const String& line4)
+{
+  state = ST_ODOMETER_OK;
+  restProbeDisplayUntilMs = millis() + 15000UL;
+  showMessage(header, line1, line2, line3, line4);
+}
+
+void restProbeReply(const uint8_t* bytes)
+{
+  if (state != ST_WAIT_REST)
+  {
+    Serial.println("Late F997 ignored");
+    return;
+  }
+  Serial.print("F997 raw:");
+  for (unsigned i = 0; i < 8; ++i)
+    Serial.printf(" %02X", bytes[i]);
+  Serial.println();
+
+  // ISO 16844-7: 8-byte SAE J1939 TimeDate structure, UTC.
+  const unsigned sec = bytes[0] / 4U;
+  const unsigned minute = bytes[1];
+  const unsigned hour = bytes[2];
+  const unsigned month = bytes[3];
+  const unsigned day = bytes[4] / 4U;
+  const int year = 1985 + bytes[5];
+  if (year < 2020 || year > 2100 || sec >= 60 || minute >= 60 ||
+      hour >= 24 || month < 1 || month > 12 || day < 1 ||
+      day > daysInMonth(year, month))
+  {
+    char h1[32], h2[32];
+    snprintf(h1, sizeof(h1), "%02X %02X %02X %02X",
+             bytes[0], bytes[1], bytes[2], bytes[3]);
+    snprintf(h2, sizeof(h2), "%02X %02X %02X %02X",
+             bytes[4], bytes[5], bytes[6], bytes[7]);
+    finishRestProbe("F997 RAW / ERROR", h1, h2,
+                    "Nieznany czas", "START bez zmian");
+    return;
+  }
+  const time_t utcEpoch = (time_t)(
+      unixDaysFromCivil(year, month, day) * 86400LL +
+      hour * 3600LL + minute * 60LL + sec);
+  struct tm localRest;
+  if (localtime_r(&utcEpoch, &localRest) == nullptr)
+  {
+    finishRestProbe("F997 CONVERT ERR", "Brak konwersji",
+                    "UTC->czas Norwegii", "START bez zmian", "");
+    return;
+  }
+  char utcText[32], localText[32];
+  snprintf(utcText, sizeof(utcText), "UTC %02u.%02u %02u:%02u",
+           day, month, hour, minute);
+  snprintf(localText, sizeof(localText), "NO  %02d.%02d %02d:%02d",
+           localRest.tm_mday, localRest.tm_mon+1,
+           localRest.tm_hour, localRest.tm_min);
+  Serial.printf("F997 LAST REST END UTC %04d-%02u-%02u %02u:%02u:%02u; Norway %04d-%02d-%02d %02d:%02d\\n",
+      year, month, day, hour, minute, sec,
+      localRest.tm_year+1900, localRest.tm_mon+1, localRest.tm_mday,
+      localRest.tm_hour, localRest.tm_min);
+  finishRestProbe("F997 KONIEC REST", utcText, localText,
+                  "TO NIE START!", "PUSH=powtorz");
 }
 
 void dailyDriveReply(uint8_t hi, uint8_t lo)
@@ -1096,6 +1176,34 @@ bool sendDailyDriveRequest()
   dailyDriveTxCount++;
   Serial.printf("F99A daily-driving-time request %lu\\n",
                 (unsigned long)dailyDriveTxCount);
+  return true;
+}
+
+// One-shot F997 request, only while stopped, on physical encoder PUSH.
+// It uses the established [01 01] KWP/ITS path and the same flow-control.
+bool sendRestProbeRequest()
+{
+  if (diagnosticsPaused || !hasOdometer || state != ST_ODOMETER_OK ||
+      tachoCredits <= 0 || client == nullptr || !client->isConnected() ||
+      !speedValid || speedRaw != 0 ||
+      (uint32_t)(millis() - speedLastOkMs) > SPEED_STALE_MS)
+    return false;
+  uint8_t msg[8] = {0x80, VU_ADDRESS, TESTER_ADDRESS,
+                    0x03, SID_READ_DATA, 0xF9, 0x97, 0};
+  msg[7] = kwpChecksum(msg, 7);
+  if (!sendDiagPacket(msg, sizeof(msg)))
+  {
+    Serial.println("F997 one-shot TX failed");
+    finishRestProbe("F997 TX ERROR", "Nie wyslano",
+                    "START bez zmian", "", "");
+    return false;
+  }
+  state = ST_WAIT_REST;
+  requestStartMs = millis();
+  restProbeDisplayUntilMs = millis() + 15000UL;
+  showMessage("F997 REST TEST", "Czytam 1 raz...",
+              "Tylko na postoju", "START bez zmian", "");
+  Serial.println("F997 one-shot sent (last daily rest end, NOT work start)");
   return true;
 }
 
@@ -1817,6 +1925,24 @@ void handleKwpFrame(
     return;
   }
 
+  // RAW UDS positive: 62 F9 97 [8-byte end of last daily rest].
+  if (length >= 11 && data[0] == SID_READ_DATA_POS &&
+      data[1] == 0xF9 && data[2] == 0x97)
+  {
+    restProbeReply(data + 3);
+    return;
+  }
+  if (state == ST_WAIT_REST && length >= 3 &&
+      data[0] == SID_NEGATIVE && data[1] == SID_READ_DATA)
+  {
+    Serial.printf("F997 raw NRC %02X\\n", data[2]);
+    char msg[24];
+    snprintf(msg, sizeof(msg), "NRC 0x%02X", data[2]);
+    finishRestProbe("F997 ODRZUCONE", msg,
+                    "Tacho nie podalo", "START bez zmian", "");
+    return;
+  }
+
   // RAW UDS positive: 62 F9 0B [8-byte TimeDate].
   if (length >= 11 && data[0] == SID_READ_DATA_POS &&
       data[1] == 0xF9 && data[2] == 0x0B)
@@ -1913,6 +2039,14 @@ void handleKwpFrame(
       data[5] == 0xF9 && data[6] == 0x9A)
   {
     dailyDriveReply(data[7], data[8]);
+    return;
+  }
+
+  // Positive F997 KWP: 80 tgt src 0B 62 F9 97 [8 bytes] CS.
+  if (sid == SID_READ_DATA_POS && length >= 16 &&
+      data[5] == 0xF9 && data[6] == 0x97)
+  {
+    restProbeReply(data + 7);
     return;
   }
 
@@ -2092,6 +2226,16 @@ void handleKwpFrame(
     if (state == ST_WAIT_DAILY)
     {
       dailyDriveUnavailable("F99A refused / consent");
+      return;
+    }
+
+    // The manual F997 experiment never stops the normal data session.
+    if (state == ST_WAIT_REST)
+    {
+      char msg[24];
+      snprintf(msg, sizeof(msg), "NRC 0x%02X", nrc);
+      finishRestProbe("F997 ODRZUCONE", msg,
+                      "Tacho nie podalo", "START bez zmian", "");
       return;
     }
 
@@ -2346,6 +2490,8 @@ bool startEverything()
   dailyDriveMinutes = 0;
   nextDailyDriveAtMs = 0;
   dailyDriveTxCount = dailyDriveRxCount = 0;
+  restProbeDisplayUntilMs = 0;
+  restProbePending = false;
   speedRetryPending = false;
   speedRetryAt = 0;
   speedRetryAttempts = 0;
@@ -2669,6 +2815,13 @@ void loop()
   processRx();
   processCreditReturn();
 
+  // Run a queued manual F997 test only between other diagnostic requests.
+  if (restProbePending && !diagnosticsPaused && state == ST_ODOMETER_OK)
+  {
+    restProbePending = false;
+    sendRestProbeRequest(); // validates a fresh standstill once more
+  }
+
   // Finish F902 receive-only grace after timeout, with zero additional
   // diagnostic requests. Display final counters including late arrivals.
   if (diagnosticsPaused && f902GraceUntilMs != 0 &&
@@ -2688,6 +2841,14 @@ void loop()
                   (unsigned long)traceF902Unexpected,
                   (unsigned long)traceF902LastRttMs,
                   (unsigned long)traceF902MaxRttMs);
+  }
+
+  // Restore normal dashboard after the F997 diagnostic display expires.
+  if (restProbeDisplayUntilMs != 0 &&
+      (int32_t)(millis() - restProbeDisplayUntilMs) >= 0)
+  {
+    restProbeDisplayUntilMs = 0;
+    if (hasOdometer && !diagnosticsPaused) showSpeedAndOdometer();
   }
 
   // Update the overspeed clock every second even between F902 responses.
@@ -2804,6 +2965,14 @@ void loop()
     speedReadFailed(0, true, false);
   }
 
+  if (!diagnosticsPaused && state == ST_WAIT_REST &&
+      (uint32_t)(millis() - requestStartMs) > REST_PROBE_TIMEOUT_MS)
+  {
+    Serial.println("F997 one-shot TIMEOUT; no retry");
+    finishRestProbe("F997 TIMEOUT", "Brak odpowiedzi",
+                    "Bez powtarzania", "START bez zmian", "");
+  }
+
   // If incoming F902 updates stop, remove the last speed from the screen.
   // Redraw once, not continuously.
   if (speedValid && !speedStaleDrawn &&
@@ -2912,6 +3081,14 @@ void loop()
   // ========================================================
   // CONFIRM
   // ========================================================
+
+  // Encoder PUSH is otherwise unused during normal running.
+  // Send exactly one F997 only on a fresh zero-speed tachograph reading.
+  if (pressed(PIN_ENC_PUSH, lastEncoderPush, encoderPushChangeMs) &&
+      !diagnosticsPaused && hasOdometer && speedValid && speedRaw == 0 &&
+      (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS &&
+      client != nullptr && client->isConnected())
+    restProbePending = true;
 
   if (pressed(
         PIN_CONFIRM,
