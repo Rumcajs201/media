@@ -9,7 +9,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.27.05-START-UI-F997-TEST";
+  "2026.10.27.06-BLE-GUARD-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -194,7 +194,7 @@ uint32_t retryOdometerAt = 0;
 // F902 is enabled only after F912 succeeds; disable on errors.
 static const uint32_t SPEED_POLL_MS = 3000;
 static const uint32_t SPEED_TIMEOUT_MS = 2500;
-// Retry F902 3 s after a timeout; keep the current BLE connection and F912.
+// Retained historical retry values; guard mode pauses TX after F902 fault.
 static const uint32_t SPEED_RETRY_MS = 3000;
 uint32_t speedRetryAt = 0;
 bool speedRetryPending = false;
@@ -323,6 +323,7 @@ volatile bool creditRejected = false;
 // ============================================================
 
 volatile bool disconnected = false;
+volatile int lastBleDisconnectReason = 0;
 
 volatile bool passkeyShown = false;
 volatile uint32_t pairingPasskey = 0;
@@ -732,15 +733,13 @@ void stopDiagnosticPolling(const char* reason)
     showF902Trace();
     return;
   }
-  // Any other fault: close ITS and BLE immediately, as in 26.21.
-  expectedDisconnect = true;
-  closeItsSession();
-  if (client != nullptr && client->isConnected())
-    client->disconnect();
+  // BLE guard: on a diagnostic fault do NOT close ITS or BLE.
+  // Keep the link intact and send no further requests/credits until BACK.
+  Serial.println("BLE GUARD: TX paused; ITS/BLE retained; BACK=controlled reconnect");
   showMessage("TrackBox RX SAFE", String(reason),
               String("FIFO:")+fifoFrames+" PAR:"+traceParseCount,
               String("CR:")+creditEvents+" TX:"+traceF912TxOk,
-              "STOP / BACK");
+              "PAUZA / BACK");
 }
 
 // Optional F99A failures must never take down working F902/F912 reads.
@@ -1415,6 +1414,7 @@ class TachoClientCallbacks
       reason
     );
 
+    lastBleDisconnectReason = reason;
     disconnected = true;
   }
 
@@ -2628,39 +2628,52 @@ bool startEverything()
 
 void restartConnection()
 {
-  Serial.println();
-  Serial.println(
-    "=== RESTART CONNECTION ==="
-  );
-
+  Serial.println("\n=== BLE GUARD: CONTROLLED RESTART ===");
+  // Stop application-level traffic immediately during manual BACK.
+  diagnosticsPaused = true;
+  speedPollingEnabled = false;
+  showMessage("BLE OCHRONA", "Zamykanie ITS...", "Czekaj na rozl.");
 
   if (client != nullptr)
   {
     if (client->isConnected())
     {
-      // Gracefully close the ITS diagnostic transport BEFORE BLE drop.
       expectedDisconnect = true;
+      // ITS close 0xFF is explicitly permitted; send once on manual BACK.
+      // There is no separate ITS close acknowledgement from SE5000.
       closeItsSession();
+      delay(1500); // allow the tachograph to process ITS close first
       client->disconnect();
+      const uint32_t disconnectStartMs = millis();
+      while (client->isConnected() &&
+             (uint32_t)(millis() - disconnectStartMs) < 5000UL)
+        delay(50);
+      if (client->isConnected())
+      {
+        // Never delete a still-connected client or establish a second link.
+        Serial.println("BLE GUARD: disconnect not confirmed; abort reconnect");
+        showMessage("BLE OCHRONA", "BLE nadal aktywne",
+                    "Bez nowego skanu", "BACK=ponow probe");
+        return;
+      }
     }
 
-    delay(200);
-
-    NimBLEDevice::deleteClient(
-      client
-    );
-
+    delay(500);
+    NimBLEDevice::deleteClient(client);
     client = nullptr;
   }
-
 
   diagService = nullptr;
   diagFifo = nullptr;
   diagCredits = nullptr;
 
-
-  delay(300);
-
+  // A session can remain allocated on the VU after a BLE teardown.
+  // Manual BACK is the ONLY trigger for a new connection attempt.
+  static const uint32_t BLE_RECONNECT_COOLDOWN_MS = 30000UL;
+  Serial.println("BLE GUARD: cooldown 30 seconds before next scan");
+  showMessage("BLE OCHRONA", "Rozlaczono BLE",
+              "Przerwa 30 sekund", "Czekaj na skan");
+  delay(BLE_RECONNECT_COOLDOWN_MS);
   startEverything();
 }
 
@@ -2769,7 +2782,7 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2",
-    "START UI 27.05",
+    "BLE GUARD 27.06",
     "F90B/F99A/F997",
     "BLE TEST"
   );
@@ -2882,10 +2895,9 @@ void loop()
       (int32_t)(millis() - f902GraceUntilMs) >= 0)
   {
     f902GraceUntilMs = 0;
-    expectedDisconnect = true;
-    closeItsSession();
-    if (client != nullptr && client->isConnected())
-      client->disconnect();
+    // Even after a late or lost reply, keep ITS/BLE alive and stop TX.
+    // No automatic disconnect/reconnect on a diagnostic timeout.
+    Serial.println("BLE GUARD: F902 grace ended, ITS/BLE retained");
     showF902Trace();
     Serial.printf("F902 trace FINAL TX:%lu RX:%lu CRC:%lu LATE:%lu BAD:%lu RTT:%lu/%lu ms\\n",
                   (unsigned long)traceF902TxOk,
@@ -2957,13 +2969,21 @@ void loop()
       !manualOdoPending && tachoCredits > 0 &&
       (int32_t)(millis() - nextTimeSyncAtMs) >= 0)
   {
-    if (!sendTimeRequest()) stopDiagnosticPolling("F90B TX FAIL");
+    if (!sendTimeRequest())
+    {
+      // Clock is optional: never tear down BLE because F90B failed.
+      nextTimeSyncAtMs = 0;
+      Serial.println("BLE GUARD: F90B TX failure; disabled until next session");
+    }
   }
 
-  if (state == ST_WAIT_TIME &&
+  if (!diagnosticsPaused && state == ST_WAIT_TIME &&
       (uint32_t)(millis() - requestStartMs) > TIME_TIMEOUT_MS)
   {
-    stopDiagnosticPolling("F90B TIMEOUT");
+    // Keep the previous synchronized RTC and normal speed/ODO polling.
+    timeSyncFailed("TIMEOUT; F90B disabled until next BLE session", true);
+    nextTimeSyncAtMs = 0;
+    Serial.println("BLE GUARD: F90B timeout without ITS/BLE close");
   }
 
   // Update the clock only when local HH:MM changes; speed redraws may
@@ -3103,7 +3123,9 @@ void loop()
     {
       diagnosticsPaused = true; // no further TX on unexpected loss
       state = ST_ERROR;
-      showMessage("TrackBox G2", "BLE rozlaczone", "BACK=connect");
+      showMessage("TrackBox G2", "BLE rozlaczone",
+                  String("Reason: ") + lastBleDisconnectReason,
+                  "BACK=connect");
     }
   }
 
