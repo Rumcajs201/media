@@ -36,6 +36,6 @@ jobs:
       - name: Upload BIN for manual test (never overwrite latest.bin)
         uses: actions/upload-artifact@v4
         with:
-          name: TrackBox_G2_F997_ONE_SHOT_TEST
+          name: TrackBox_G2_27_07_ITS_SAFE_TEST
           path: build/*.ino.bin
           retention-days: 14
