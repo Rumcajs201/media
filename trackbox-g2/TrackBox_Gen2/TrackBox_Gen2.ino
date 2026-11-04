@@ -204,7 +204,7 @@ static const uint32_t SPEED_RETRY_MS = 3000;
 uint32_t speedRetryAt = 0;
 bool speedRetryPending = false;
 uint32_t speedRetryAttempts = 0;
-static const uint32_t SPEED_STALE_MS = 6000;
+static const uint32_t SPEED_STALE_MS = 15000; // Must exceed 10s poll.
 
 // Automatic F912 refresh: 2-second cadence without interrupting F902.
 // On periodic failure retry later; never send StartCommunication as fallback.
@@ -297,7 +297,7 @@ portMUX_TYPE rxMux =
   portMUX_INITIALIZER_UNLOCKED;
 
 // Credits granted at startup must match available RX packet slots.
-// Preserve 23.11's proven initial grant of 32, with 32 real slots.
+// Grant only 4 initial credits in 27.07; retain 32 physical queue slots.
 static const uint8_t RX_CAPACITY = 32;
 static const size_t RX_PACKET_MAX = 128;
 struct RxPacket { uint8_t data[RX_PACKET_MAX]; uint8_t size; };
@@ -739,9 +739,8 @@ void stopDiagnosticPolling(const char* reason)
     showF902Trace();
     return;
   }
-  // BLE guard: on a diagnostic fault do NOT close ITS or BLE.
-  // Keep the link intact and send no further requests/credits until BACK.
-  Serial.println("BLE GUARD: TX paused; ITS/BLE retained; BACK=controlled reconnect");
+  // Fail closed after diagnostic fault; never automatically reconnect.
+  Serial.println("ITS SAFE: TX paused; controlled ITS/BLE close scheduled");
   showMessage("TrackBox RX SAFE", String(reason),
               String("FIFO:")+fifoFrames+" PAR:"+traceParseCount,
               String("CR:")+creditEvents+" TX:"+traceF912TxOk,
@@ -2422,6 +2421,7 @@ void processCredits()
   if (rejected || overflow || tachoCredits < 0 ||
       count > (2147483647UL - (uint32_t)tachoCredits))
   {
+    if (rejected) transportConfigured = false; // Peer already closed ITS.
     stopDiagnosticPolling(rejected ? "CREDIT CLOSED" : "CREDIT OVERFLOW");
     return;
   }
@@ -2934,9 +2934,8 @@ void loop()
       (int32_t)(millis() - f902GraceUntilMs) >= 0)
   {
     f902GraceUntilMs = 0;
-    // Even after a late or lost reply, keep ITS/BLE alive and stop TX.
-    // No automatic disconnect/reconnect on a diagnostic timeout.
-    Serial.println("BLE GUARD: F902 grace ended, ITS/BLE retained");
+    // The independent shutdown state machine closes ITS and BLE once.
+    Serial.println("ITS SAFE: F902 grace finished");
     showF902Trace();
     Serial.printf("F902 trace FINAL TX:%lu RX:%lu CRC:%lu LATE:%lu BAD:%lu RTT:%lu/%lu ms\\n",
                   (unsigned long)traceF902TxOk,
