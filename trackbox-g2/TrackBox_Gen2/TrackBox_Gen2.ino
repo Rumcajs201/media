@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <NimBLEDevice.h>
+#include "ItsSafeGuard.h"
 #include <esp_ota_ops.h>
 #include <sys/time.h>
 #include <time.h>
@@ -9,7 +10,13 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.27.06-BLE-GUARD-TEST";
+  "2026.11.04.01-ITS-SAFE-OFFLINE";
+
+static constexpr bool TB_SAFE_ALLOW_BLE = false;  // No RF until explicitly enabled.
+static constexpr bool TB_SAFE_ONE_SHOT = true;    // Only first F912, no polling.
+static constexpr uint32_t TB_SAFE_MIN_TX_GAP_MS = 5000UL;
+static constexpr uint16_t TB_SAFE_MAX_TX = 1U;
+ItsSafeGuard itsSafeGuard;
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -293,7 +300,7 @@ portMUX_TYPE rxMux =
 
 // Credits granted at startup must match available RX packet slots.
 // Preserve 23.11's proven initial grant of 32, with 32 real slots.
-static const uint8_t RX_CAPACITY = 32;
+static const uint8_t RX_CAPACITY = 8;
 static const size_t RX_PACKET_MAX = 128;
 struct RxPacket { uint8_t data[RX_PACKET_MAX]; uint8_t size; };
 RxPacket rxQueue[RX_CAPACITY];
@@ -696,6 +703,10 @@ void stopDiagnosticPolling(const char* reason)
 {
   if (diagnosticsPaused) return;
   diagnosticsPaused = true;
+  // One closing credit write is scheduled after a receive-only grace period.
+  itsSafeGuard.pauseAndScheduleClose(
+      millis(), strcmp(reason, "F902 TIMEOUT") == 0 ?
+                  F902_PASSIVE_GRACE_MS : 100UL);
   speedPollingEnabled = false;
   speedRetryPending = false;
   retryOdometerPending = false;
@@ -884,7 +895,16 @@ void onOdometerReadOk()
   hasOdometer = true;
   periodicOdoInFlight = false;
   nextOdoRequestAt = millis() + ODO_POLL_MS;
-
+  if (TB_SAFE_ONE_SHOT)
+  {
+    speedPollingEnabled = false;
+    dailyDriveEnabled = false;
+    nextTimeSyncAtMs = 0;
+    diagnosticsPaused = true;
+    itsSafeGuard.pauseAndScheduleClose(millis(), 1200UL);
+    showMessage("ITS SAFE", "F912 1x OK", "Close queued", "NO RETRY");
+    return;
+  }
   if (firstOdo)
   {
     speedPollingEnabled = true;
@@ -1096,6 +1116,12 @@ bool sendDiagPacket(
     return false;
   }
 
+  if (!itsSafeGuard.allowRequest(millis(), TB_SAFE_MIN_TX_GAP_MS,
+                                 TB_SAFE_MAX_TX))
+  {
+    Serial.println("ITS SAFE: request budget exhausted or TX blocked");
+    return false;
+  }
   uint8_t framed[20] = {0};
   framed[0] = 0x01;
   framed[1] = 0x01;
@@ -1196,6 +1222,7 @@ bool sendOdometerRequest()
 // Optional F99A RDBI. Same proven KWP/ITS [01 01] outgoing framing.
 bool sendDailyDriveRequest()
 {
+  if (TB_SAFE_ONE_SHOT) return false;
   if (diagnosticsPaused || !dailyDriveEnabled || !hasOdometer ||
       state != ST_ODOMETER_OK || tachoCredits <= 0 ||
       !speedValid || speedRaw == 0 ||
@@ -1225,6 +1252,7 @@ bool sendDailyDriveRequest()
 // Always only when stopped and between existing F902/F912/F90B requests.
 bool sendRestProbeRequest(bool manual)
 {
+  if (TB_SAFE_ONE_SHOT) return false;
   if (diagnosticsPaused || !hasOdometer || state != ST_ODOMETER_OK ||
       tachoCredits <= 0 || client == nullptr || !client->isConnected() ||
       !speedValid || speedRaw != 0 ||
@@ -1258,6 +1286,7 @@ bool sendRestProbeRequest(bool manual)
 
 bool sendSpeedRequest()
 {
+  if (TB_SAFE_ONE_SHOT) return false;
   if (!hasOdometer || !speedPollingEnabled ||
       state != ST_ODOMETER_OK || tachoCredits <= 0)
     return false;
@@ -1283,6 +1312,7 @@ bool sendSpeedRequest()
 // Separate F90B request. Never overlap F902/F912 requests.
 bool sendTimeRequest()
 {
+  if (TB_SAFE_ONE_SHOT) return false;
   if (!hasOdometer || state != ST_ODOMETER_OK || tachoCredits <= 0)
     return false;
 
@@ -1312,6 +1342,7 @@ bool sendTimeRequest()
 
 bool sendStartCommunication()
 {
+  if (TB_SAFE_ONE_SHOT) return false;
   uint8_t msg[5];
 
   msg[0] = 0x81;
@@ -1849,7 +1880,7 @@ bool setupDiagnosticTransport()
 
   delay(100);
 
-  if (!giveCreditsToTacho(32))
+  if (!giveCreditsToTacho(RX_CAPACITY))
   {
     Serial.println(
       "Credit write FAILED"
@@ -1860,6 +1891,7 @@ bool setupDiagnosticTransport()
 
 
   transportConfigured = true;
+  itsSafeGuard.activate();
 
   showMessage(
     "TrackBox G2 DIAG",
@@ -2794,10 +2826,17 @@ void setup()
   );
 
 
+  // Safety lock: power-up does not scan, connect or send to tachograph.
+  if (!TB_SAFE_ALLOW_BLE)
+  {
+    Serial.println("ITS SAFE: OFFLINE MODE; BLE is not initialized");
+    showMessage("TrackBox ITS SAFE", "OFFLINE MODE",
+                "BLE DISABLED", "NO VU TRAFFIC");
+    return;
+  }
   // ========================================================
   // BLE
   // ========================================================
-
   Serial.println();
   Serial.println(
     "======================================"
@@ -2830,7 +2869,7 @@ void setup()
   // Bonding + Secure Connections
   NimBLEDevice::setSecurityAuth(
     true,
-    false,
+    true,
     true
   );
 
@@ -2872,6 +2911,20 @@ void setup()
 
 void loop()
 {
+  if (!TB_SAFE_ALLOW_BLE) { delay(100); return; }
+  if (itsSafeGuard.closeDue(millis()))
+  {
+    Serial.println("ITS SAFE: single ITS close, BLE disconnect, no reconnect");
+    if (client != nullptr && client->isConnected())
+    {
+      closeItsSession();
+      expectedDisconnect = true;
+      client->disconnect();
+    }
+    transportConfigured = false;
+    showMessage("ITS SAFE", "Session closed", "BLE stopped", "NO RETRY");
+  }
+
   // ========================================================
   // BLE EVENTS
   // ========================================================
@@ -3181,7 +3234,7 @@ void loop()
       client != nullptr && client->isConnected())
     restProbePending = true;
 
-  if (pressed(
+  if (!TB_SAFE_ONE_SHOT && pressed(
         PIN_CONFIRM,
         lastConfirm,
         confirmChangeMs))
@@ -3231,7 +3284,7 @@ void loop()
         lastBack,
         backChangeMs))
   {
-    restartConnection();
+    Serial.println("ITS SAFE: BACK reconnect disabled in prototype");
   }
 
 
