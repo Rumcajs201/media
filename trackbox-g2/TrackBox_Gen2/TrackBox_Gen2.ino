@@ -2621,6 +2621,12 @@ bool startEverything()
 
   if (!connectTachograph())
   {
+    // Security/connection failure must not leave a live BLE link.
+    if (client != nullptr && client->isConnected())
+    {
+      expectedDisconnect = true;
+      client->disconnect();
+    }
     state = ST_ERROR;
     blePairingFailed = true;
 
@@ -2637,6 +2643,13 @@ bool startEverything()
 
   if (!setupDiagnosticTransport())
   {
+    // A partially initialized GATT session is not allowed to stay open.
+    if (client != nullptr && client->isConnected())
+    {
+      expectedDisconnect = true;
+      client->disconnect();
+    }
+    transportConfigured = false;
     state = ST_ERROR;
 
     showMessage(
