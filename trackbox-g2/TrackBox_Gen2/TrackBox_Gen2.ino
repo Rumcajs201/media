@@ -6,10 +6,11 @@
 #include <sys/time.h>
 #include <time.h>
 #include <stdlib.h>
+#include "ItsSafetyGuard.h"
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.10.27.06-BLE-GUARD-TEST";
+  "2026.11.04.07-ITS-SAFE-DIAG-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -162,6 +163,10 @@ uint8_t lastScanRounds = 0;
 volatile int tachoCredits = 0;
 
 bool transportConfigured = false;
+ItsSafetyGuard itsGuard;
+static constexpr bool ENABLE_TIME_DIAG=false;
+static constexpr bool ENABLE_DAILY_DIAG=false;
+static constexpr bool ENABLE_REST_DIAG=false;
 bool firstReadSent = false;
 
 bool fallbackStartCommUsed = false;
@@ -192,7 +197,7 @@ bool retryOdometerPending = false;
 uint32_t retryOdometerAt = 0;
 
 // F902 is enabled only after F912 succeeds; disable on errors.
-static const uint32_t SPEED_POLL_MS = 3000;
+static const uint32_t SPEED_POLL_MS = 10000;
 static const uint32_t SPEED_TIMEOUT_MS = 2500;
 // Retained historical retry values; guard mode pauses TX after F902 fault.
 static const uint32_t SPEED_RETRY_MS = 3000;
@@ -203,7 +208,7 @@ static const uint32_t SPEED_STALE_MS = 6000;
 
 // Automatic F912 refresh: 2-second cadence without interrupting F902.
 // On periodic failure retry later; never send StartCommunication as fallback.
-static const uint32_t ODO_POLL_MS = 15000;
+static const uint32_t ODO_POLL_MS = 60000;
 static const uint32_t ODO_RETRY_MS = 6000;
 static const uint32_t ODO_PERIODIC_TIMEOUT_MS = 3500;
 uint32_t nextOdoRequestAt = 0;
@@ -696,6 +701,7 @@ void stopDiagnosticPolling(const char* reason)
 {
   if (diagnosticsPaused) return;
   diagnosticsPaused = true;
+  itsGuard.stop(millis(), strcmp(reason,"F902 TIMEOUT")==0);
   speedPollingEnabled = false;
   speedRetryPending = false;
   retryOdometerPending = false;
@@ -893,7 +899,7 @@ void onOdometerReadOk()
     speedPayloadInvalid = false;
     speedStaleDrawn = false;
     nextSpeedRequestAt = millis() + SPEED_POLL_MS;
-    nextTimeSyncAtMs = millis() + 5000UL;
+    nextTimeSyncAtMs = ENABLE_TIME_DIAG ? millis()+5000UL : 0;
   }
 
   showSpeedAndOdometer();
@@ -1059,7 +1065,7 @@ bool sendDiagPacket(
   size_t length
 )
 {
-  if (client == nullptr ||
+  if (!itsGuard.active() || diagnosticsPaused || client == nullptr ||
       !client->isConnected())
   {
     Serial.println("TX ERROR: BLE not connected");
@@ -1637,11 +1643,12 @@ bool connectTachograph()
   );
 
   client->setConnectionParams(
-    12,
-    24,
+    24, // 30ms min
+    48, // 60ms max
     0,
-    200
+    400 // supervision 4s
   );
+  client->setConnectRetries(0);
 
   client->setConnectTimeout(
     10000
@@ -1849,7 +1856,7 @@ bool setupDiagnosticTransport()
 
   delay(100);
 
-  if (!giveCreditsToTacho(32))
+  if (!giveCreditsToTacho(4))
   {
     Serial.println(
       "Credit write FAILED"
@@ -2319,7 +2326,7 @@ void handleKwpFrame(
     {
       fallbackStartCommUsed = true;
 
-      sendStartCommunication();
+      stopDiagnosticPolling("FIRST F912 NRC");
 
       return;
     }
@@ -2492,6 +2499,7 @@ bool pressed(
 
 bool startEverything()
 {
+  itsGuard.start(millis());
   // Jedna proba polaczenia = jeden zestaw licznikow.
   portENTER_CRITICAL(&rxMux);
   traceFifoCb = 0;
@@ -2535,7 +2543,7 @@ bool startEverything()
   speedLastOkMs = 0;
   nextSpeedRequestAt = 0;
   speedReplies = 0;
-  dailyDriveEnabled = true;
+  dailyDriveEnabled = ENABLE_DAILY_DIAG;
   dailyDriveValid = false;
   dailyDriveMinutes = 0;
   nextDailyDriveAtMs = 0;
@@ -2574,6 +2582,7 @@ bool startEverything()
 
   if (!findTachograph())
   {
+    stopDiagnosticPolling("SCAN FAIL");
     state = ST_ERROR;
     showMessage(
       "SE5000 NIE ZNAL.",
@@ -2589,6 +2598,7 @@ bool startEverything()
 
   if (!connectTachograph())
   {
+    stopDiagnosticPolling("CONNECT/SEC FAIL");
     state = ST_ERROR;
     blePairingFailed = true;
 
@@ -2605,6 +2615,7 @@ bool startEverything()
 
   if (!setupDiagnosticTransport())
   {
+    stopDiagnosticPolling("ITS SETUP FAIL");
     state = ST_ERROR;
 
     showMessage(
@@ -2626,54 +2637,78 @@ bool startEverything()
 // RESTART CONNECTION
 // ============================================================
 
+// Fail-closed single-shot ITS 0xFF and BLE disconnect.
+// No delay(30000), no automatic rescan. Controlled from loop().
+void serviceItsShutdown()
+{
+  const uint32_t now=millis();
+  if(itsGuard.sessionExpired(now))
+    stopDiagnosticPolling("SESSION LIMIT 3 MIN");
+  if(itsGuard.shouldClose(now))
+  {
+    f902GraceUntilMs=0;
+    if(client && client->isConnected() && transportConfigured)
+      closeItsSession(); // exactly one GATT 0xFF attempt
+    else
+      transportConfigured=false;
+    itsGuard.closed(now);
+    Serial.println("ITS SAFE: close attempted once");
+  }
+  if(itsGuard.shouldDisconnect(now))
+  {
+    if(client && client->isConnected())
+    {
+      expectedDisconnect=true;
+      const bool initiated=client->disconnect();
+      Serial.printf("ITS SAFE: BLE disconnect request %d\n",(int)initiated);
+    }
+    itsGuard.disconnectIssued(now);
+  }
+  if(itsGuard.awaitingBle())
+  {
+    if(client==nullptr || !client->isConnected())
+    {
+      itsGuard.linkDown(now);
+      transportConfigured=false;
+      diagService=nullptr;diagFifo=nullptr;diagCredits=nullptr;
+      showMessage("ITS SAFE 27.07","BLE ZAKONCZONE",
+                  "AUTO RETRY OFF","BACK PO 60s");
+      Serial.println("ITS SAFE: down; cooldown; manual only");
+    }
+    else if(itsGuard.timedOut(now))
+    {
+      itsGuard.lock(now);
+      showMessage("ITS SAFE 27.07","BRAK ROZLACZ.",
+                  "NIE WZNAWIAJ","BLE NIEPEWNE");
+      Serial.println("ITS SAFE: disconnect not confirmed. Never rescan.");
+    }
+  }
+}
+
 void restartConnection()
 {
-  Serial.println("\n=== BLE GUARD: CONTROLLED RESTART ===");
-  // Stop application-level traffic immediately during manual BACK.
-  diagnosticsPaused = true;
-  speedPollingEnabled = false;
-  showMessage("BLE OCHRONA", "Zamykanie ITS...", "Czekaj na rozl.");
-
-  if (client != nullptr)
+  const uint32_t now=millis();
+  if(itsGuard.active())
   {
-    if (client->isConnected())
-    {
-      expectedDisconnect = true;
-      // ITS close 0xFF is explicitly permitted; send once on manual BACK.
-      // There is no separate ITS close acknowledgement from SE5000.
-      closeItsSession();
-      delay(1500); // allow the tachograph to process ITS close first
-      client->disconnect();
-      const uint32_t disconnectStartMs = millis();
-      while (client->isConnected() &&
-             (uint32_t)(millis() - disconnectStartMs) < 5000UL)
-        delay(50);
-      if (client->isConnected())
-      {
-        // Never delete a still-connected client or establish a second link.
-        Serial.println("BLE GUARD: disconnect not confirmed; abort reconnect");
-        showMessage("BLE OCHRONA", "BLE nadal aktywne",
-                    "Bez nowego skanu", "BACK=ponow probe");
-        return;
-      }
-    }
-
-    delay(500);
-    NimBLEDevice::deleteClient(client);
-    client = nullptr;
+    stopDiagnosticPolling("BACK MANUAL STOP");
+    return;
   }
-
-  diagService = nullptr;
-  diagFifo = nullptr;
-  diagCredits = nullptr;
-
-  // A session can remain allocated on the VU after a BLE teardown.
-  // Manual BACK is the ONLY trigger for a new connection attempt.
-  static const uint32_t BLE_RECONNECT_COOLDOWN_MS = 30000UL;
-  Serial.println("BLE GUARD: cooldown 30 seconds before next scan");
-  showMessage("BLE OCHRONA", "Rozlaczono BLE",
-              "Przerwa 30 sekund", "Czekaj na skan");
-  delay(BLE_RECONNECT_COOLDOWN_MS);
+  if(!itsGuard.canStart(now,client && client->isConnected()))
+  {
+    showMessage("ITS SAFE 27.07","AUTO RETRY OFF",
+                String("Przerwa ")+(itsGuard.remaining(now)/1000U)+"s",
+                "BACK PO CZASIE");
+    return;
+  }
+  if(client)
+  {
+    if(client->isConnected())return;
+    NimBLEDevice::deleteClient(client);
+    client=nullptr;
+  }
+  transportConfigured=false;
+  diagService=nullptr;diagFifo=nullptr;diagCredits=nullptr;
+  Serial.println("ITS SAFE: one MANUAL start");
   startEverything();
 }
 
@@ -2782,9 +2817,9 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2",
-    "BLE GUARD 27.06",
-    "F90B/F99A/F997",
-    "BLE TEST"
+    "ITS SAFE 27.07",
+    "F902/F912 ONLY",
+    "MANUAL START"
   );
   delay(1200);
 
@@ -2818,7 +2853,7 @@ void setup()
 
 
   NimBLEDevice::setMTU(
-    247
+    23 // Minimal valid ATT_MTU for our short F902/F912 messages.
   );
 
 
@@ -2830,7 +2865,7 @@ void setup()
   // Bonding + Secure Connections
   NimBLEDevice::setSecurityAuth(
     true,
-    false,
+    true,  // numeric comparison MITM
     true
   );
 
@@ -2862,7 +2897,10 @@ void setup()
   delay(300);
 
 
-  startEverything();
+  diagnosticsPaused=true;
+  state=ST_ERROR;
+  showMessage("ITS SAFE 27.07","AUTO START OFF","F902 / F912","BACK=START");
+  Serial.println("ITS SAFE: no automatic connection on boot");
 }
 
 
@@ -2876,6 +2914,7 @@ void loop()
   // BLE EVENTS
   // ========================================================
 
+  serviceItsShutdown();
   if (rxQueueOverflow && !diagnosticsPaused)
     stopDiagnosticPolling("RX QUEUE FULL");
   processCredits();
@@ -2963,7 +3002,7 @@ void loop()
   // Do not automatically retry a failed F902; stop all polling on fault.
   // Clock requests are optional and run between F912 and F902 polling.
   // A failure affects only the clock; never the established data session.
-  if (hasOdometer && !diagnosticsPaused &&
+  if (ENABLE_TIME_DIAG && hasOdometer && !diagnosticsPaused &&
       state == ST_ODOMETER_OK &&
       nextTimeSyncAtMs != 0 &&
       !manualOdoPending && tachoCredits > 0 &&
@@ -2996,7 +3035,7 @@ void loop()
   // automatic F997 attempt, and only when fresh F902 reports standstill.
   // This does not run during BLE pairing or when driving. Any refusal or
   // timeout is optional and never disconnects the session.
-  if (!restAutoAttempted && clockValid && !diagnosticsPaused &&
+  if (ENABLE_REST_DIAG && !restAutoAttempted && clockValid && !diagnosticsPaused &&
       (uint32_t)(millis() - diagReadyMs) >= REST_AUTO_SETTLE_MS &&
       hasOdometer && !manualOdoPending && !restProbePending &&
       state == ST_ODOMETER_OK && tachoCredits > 0 &&
@@ -3025,7 +3064,7 @@ void loop()
   // Read optional F99A only when we have a fresh nonzero speed.
   // Place between existing F912 refresh and F902; no two queries overlap.
   // On standstill (raw speed 0), never request daily-driving time.
-  if (hasOdometer && dailyDriveEnabled && !diagnosticsPaused &&
+  if (ENABLE_DAILY_DIAG && hasOdometer && dailyDriveEnabled && !diagnosticsPaused &&
       state == ST_ODOMETER_OK && speedValid && speedRaw > 0 &&
       (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS &&
       tachoCredits > 0 &&
@@ -3050,7 +3089,7 @@ void loop()
   if (!diagnosticsPaused && state == ST_WAIT_SPEED &&
       (uint32_t)(millis() - requestStartMs) > SPEED_TIMEOUT_MS)
   {
-    Serial.println("F902 TIMEOUT; keep F912 operational");
+    Serial.println("F902 TIMEOUT -> ITS shutdown");
     speedReadFailed(0, true, false);
   }
 
@@ -3075,22 +3114,11 @@ void loop()
   // TIMEOUT F912
   // ========================================================
 
-  if (state == ST_WAIT_ODOMETER &&
+  if (!diagnosticsPaused && state == ST_WAIT_ODOMETER &&
       (uint32_t)(millis() - requestStartMs) >
         (hasOdometer ? ODO_PERIODIC_TIMEOUT_MS : 1500UL))
   {
-    if (hasOdometer)
-      stopDiagnosticPolling("F912 TIMEOUT");
-    else if (!fallbackStartCommUsed)
-    {
-      // Preserve the tested 23.11 first-read StartCommunication fallback.
-      fallbackStartCommUsed = true;
-      Serial.println("F912 startup timeout -> StartCommunication");
-      if (!sendStartCommunication())
-        stopDiagnosticPolling("STARTCOMM TX");
-    }
-    else
-      stopDiagnosticPolling("FIRST F912");
+    stopDiagnosticPolling(hasOdometer ? "F912 TIMEOUT" : "FIRST F912 TIMEOUT");
   }
 
   // ========================================================
@@ -3114,19 +3142,17 @@ void loop()
     disconnected = false;
     overspeedActive = false;
     overspeedLastShownSec = 0xFFFFFFFFUL;
-    if (expectedDisconnect || diagnosticsPaused)
-    {
-      expectedDisconnect = false;
-      // Retain RX SAFE fault diagnostics, do not replace with BLE lost.
-    }
-    else
-    {
-      diagnosticsPaused = true; // no further TX on unexpected loss
-      state = ST_ERROR;
-      showMessage("TrackBox G2", "BLE rozlaczone",
-                  String("Reason: ") + lastBleDisconnectReason,
-                  "BACK=connect");
-    }
+    const bool wasExpected=expectedDisconnect;
+    expectedDisconnect=false;
+    diagnosticsPaused=true;
+    speedPollingEnabled=false;
+    transportConfigured=false;
+    itsGuard.linkDown(millis());
+    state=ST_ERROR;
+    if(!wasExpected)
+      showMessage("ITS SAFE 27.07","BLE ROZLACZONE",
+                  String("Reason: ")+lastBleDisconnectReason,
+                  "AUTO RETRY OFF");
   }
 
 
@@ -3175,7 +3201,7 @@ void loop()
 
   // Encoder PUSH is otherwise unused during normal running.
   // Send exactly one F997 only on a fresh zero-speed tachograph reading.
-  if (pressed(PIN_ENC_PUSH, lastEncoderPush, encoderPushChangeMs) &&
+  if (ENABLE_REST_DIAG && pressed(PIN_ENC_PUSH, lastEncoderPush, encoderPushChangeMs) &&
       !diagnosticsPaused && hasOdometer && speedValid && speedRaw == 0 &&
       (uint32_t)(millis() - speedLastOkMs) <= SPEED_STALE_MS &&
       client != nullptr && client->isConnected())
@@ -3197,8 +3223,8 @@ void loop()
         ok ? "Bonds cleared" : "Bonds failure",
         "Ponowny skan..."
       );
-      delay(600);
-      restartConnection();
+      // Bond clear is explicit but does NOT automatically reconnect.
+      Serial.println("Bonds erased; manual BACK required");
     }
     else if (!diagnosticsPaused &&
              (state == ST_DIAG_READY ||
