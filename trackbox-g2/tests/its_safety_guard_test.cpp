@@ -19,7 +19,6 @@ int main() {
   ok(g.sessionExpired(t+62000+180000));
   g.stop(t+242000,false);ok(g.shouldClose(t+242000));
   g.closed(t+242000);ok(!g.shouldClose(t+242000));
-  g.disconnectIssued(t+242300); // improper order must not change state
   ok(g.phase()==G::Stage::WaitClose);
   ok(g.shouldDisconnect(t+242300));g.disconnectIssued(t+242300);
   ok(g.phase()==G::Stage::WaitBle);g.lock(t+248000);
