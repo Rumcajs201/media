@@ -1473,11 +1473,12 @@ class TachoClientCallbacks
       "Potwierdz ten sam kod na tachografie."
     );
 
-    // Poniewaz to my uruchomilismy polaczenie
-    // do znalezionego SE5000, lokalnie akceptujemy.
+    // Safety prototype: never auto-accept numeric comparison.
+    // Existing bonds can be used; fresh pairing is intentionally rejected.
+    // A future UI must compare both codes and require explicit user consent.
     NimBLEDevice::injectConfirmPasskey(
       connInfo,
-      true
+      false
     );
   }
 
