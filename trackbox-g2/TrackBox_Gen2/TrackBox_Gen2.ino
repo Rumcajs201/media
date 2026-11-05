@@ -2671,14 +2671,14 @@ void serviceItsShutdown()
       itsGuard.linkDown(now);
       transportConfigured=false;
       diagService=nullptr;diagFifo=nullptr;diagCredits=nullptr;
-      showMessage("ITS SAFE 27.07","BLE ZAKONCZONE",
+      showMessage("ITS SAFE 27.08","BLE ZAKONCZONE",
                   "AUTO RETRY OFF","BACK PO 60s");
       Serial.println("ITS SAFE: down; cooldown; manual only");
     }
     else if(itsGuard.timedOut(now))
     {
       itsGuard.lock(now);
-      showMessage("ITS SAFE 27.07","BRAK ROZLACZ.",
+      showMessage("ITS SAFE 27.08","BRAK ROZLACZ.",
                   "NIE WZNAWIAJ","BLE NIEPEWNE");
       Serial.println("ITS SAFE: disconnect not confirmed. Never rescan.");
     }
@@ -2695,7 +2695,7 @@ void restartConnection()
   }
   if(!itsGuard.canStart(now,client && client->isConnected()))
   {
-    showMessage("ITS SAFE 27.07","AUTO RETRY OFF",
+    showMessage("ITS SAFE 27.08","AUTO RETRY OFF",
                 String("Przerwa ")+(itsGuard.remaining(now)/1000U)+"s",
                 "BACK PO CZASIE");
     return;
@@ -2817,7 +2817,7 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2",
-    "ITS SAFE 27.07",
+    "ITS SAFE 27.08",
     "F902/F912 ONLY",
     "MANUAL START"
   );
@@ -2899,7 +2899,7 @@ void setup()
 
   diagnosticsPaused=true;
   state=ST_ERROR;
-  showMessage("ITS SAFE 27.07","AUTO START OFF","F902 / F912","BACK=START");
+  showMessage("ITS SAFE 27.08","AUTO START OFF","F902 / F912","BACK=START");
   Serial.println("ITS SAFE: no automatic connection on boot");
 }
 
@@ -3149,7 +3149,7 @@ void loop()
     itsGuard.linkDown(millis());
     state=ST_ERROR;
     if(!wasExpected)
-      showMessage("ITS SAFE 27.07","BLE ROZLACZONE",
+      showMessage("ITS SAFE 27.08","BLE ROZLACZONE",
                   String("Reason: ")+lastBleDisconnectReason,
                   "AUTO RETRY OFF");
   }
