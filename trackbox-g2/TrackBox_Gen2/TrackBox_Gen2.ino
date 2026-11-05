@@ -10,7 +10,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.11.04.07-ITS-SAFE-DIAG-TEST";
+  "2026.11.05.08-ITS-SAFE-AUTH-TEST";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -2865,7 +2865,7 @@ void setup()
   // Bonding + Secure Connections
   NimBLEDevice::setSecurityAuth(
     true,
-    true,  // numeric comparison MITM
+    false, // Restore proven 27.06 authentication configuration.
     true
   );
 
