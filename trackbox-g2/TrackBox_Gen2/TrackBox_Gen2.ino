@@ -10,7 +10,7 @@
 
 // Parsed by GitHub Actions only; intentionally not used at runtime.
 static const char* TB_FW_VERSION =
-  "2026.11.05.08-ITS-SAFE-AUTH-TEST";
+  "2026.11.05.09-BLE-PREFLIGHT-ONLY";
 
 // ============================================================
 // TrackBox Gen2 - Stoneridge SE5000 diagnostic tester
@@ -164,6 +164,13 @@ volatile int tachoCredits = 0;
 
 bool transportConfigured = false;
 ItsSafetyGuard itsGuard;
+// 27.09: connection preflight only. Absolutely NO ITS transport writes.
+static constexpr bool ENABLE_ITS_DIAG=false;
+static constexpr uint32_t BLE_PROBE_MS=15000UL;
+uint32_t bleProbeDeadlineMs=0;
+bool bleProbeLinkOk=false;
+bool bleProbeAuthOk=false;
+int bleProbeLastError=0;
 static constexpr bool ENABLE_TIME_DIAG=false;
 static constexpr bool ENABLE_DAILY_DIAG=false;
 static constexpr bool ENABLE_REST_DIAG=false;
@@ -1409,6 +1416,12 @@ class TachoClientCallbacks
   }
 
 
+  void onConnectFail(NimBLEClient* pClient, int reason) override
+  {
+    bleProbeLastError=reason;
+    Serial.printf("BLE CONNECT FAILED: %d (0x%X)\n",reason,(unsigned)reason);
+  }
+
   void onDisconnect(
     NimBLEClient* pClient,
     int reason
@@ -1641,13 +1654,13 @@ bool connectTachograph()
     false
   );
 
+  // Exact connection parameters of historical 27.06.
   client->setConnectionParams(
-    24, // 30ms min
-    48, // 60ms max
+    12,
+    24,
     0,
-    400 // supervision 4s
+    200
   );
-  client->setConnectRetries(0);
 
   client->setConnectTimeout(
     10000
@@ -1665,16 +1678,14 @@ bool connectTachograph()
 
   if (!client->connect(address))
   {
-    Serial.println(
-      "CONNECT FAILED"
-    );
-
+    bleProbeLastError=client->getLastError();
+    Serial.printf("CONNECT FAILED: code=%d (0x%X)\n",
+                  bleProbeLastError,(unsigned)bleProbeLastError);
     return false;
   }
 
-  Serial.println(
-    "BLE CONNECT OK"
-  );
+  bleProbeLinkOk=true;
+  Serial.println("BLE CONNECT OK");
 
   Serial.printf(
     "RSSI: %d dBm\n",
@@ -1713,16 +1724,14 @@ bool connectTachograph()
 
   if (!secure)
   {
-    Serial.println(
-      "Security nie przeszlo."
-    );
-
+    bleProbeLastError=client->getLastError();
+    Serial.printf("SECURE FAILED: code=%d (0x%X)\n",
+                  bleProbeLastError,(unsigned)bleProbeLastError);
     return false;
   }
 
-  Serial.print(
-    "Bonded: "
-  );
+  bleProbeAuthOk=true;
+  Serial.print("Bonded: ");
 
   Serial.println(
     NimBLEDevice::isBonded(
@@ -2500,6 +2509,11 @@ bool pressed(
 bool startEverything()
 {
   itsGuard.start(millis());
+  bleProbeDeadlineMs=0;
+  bleProbeLinkOk=false;
+  bleProbeAuthOk=false;
+  bleProbeLastError=0;
+  lastBleDisconnectReason=0;
   // Jedna proba polaczenia = jeden zestaw licznikow.
   portENTER_CRITICAL(&rxMux);
   traceFifoCb = 0;
@@ -2583,15 +2597,10 @@ bool startEverything()
   if (!findTachograph())
   {
     stopDiagnosticPolling("SCAN FAIL");
-    state = ST_ERROR;
-    showMessage(
-      "SE5000 NIE ZNAL.",
-      String("Skan ") + lastScanRounds +
-        "/3: " + (lastScanElapsedMs / 1000) + "s",
-      String("BLE dev: ") + lastScanDevices,
-      "CONF=clear bonds",
-      "BACK=retry"
-    );
+    state=ST_ERROR;
+    showMessage("BLE TEST 27.09","SE5000 NIE ZNAL.",
+                String("BLE dev: ")+lastScanDevices,
+                "BONDS BEZ ZMIAN","AUTO RETRY OFF");
     return false;
   }
 
@@ -2599,19 +2608,25 @@ bool startEverything()
   if (!connectTachograph())
   {
     stopDiagnosticPolling("CONNECT/SEC FAIL");
-    state = ST_ERROR;
-    blePairingFailed = true;
-
-    showMessage(
-      "TrackBox G2",
-      "BLE / Security",
-      "FAILED",
-      "CONF=clear bonds",
-      "BACK=retry"
-    );
+    state=ST_ERROR;
+    blePairingFailed=bleProbeLinkOk;
+    showMessage("BLE TEST 27.09",
+                bleProbeLinkOk ? "AUTH FAIL" : "CONNECT FAIL",
+                String("ERR: ")+bleProbeLastError,
+                "BONDS BEZ ZMIAN","AUTO RETRY OFF");
     return false;
   }
 
+
+  if (!ENABLE_ITS_DIAG)
+  {
+    // Control-flow barrier: ZERO ITS service discovery or diagnostic traffic.
+    bleProbeDeadlineMs=millis()+BLE_PROBE_MS;
+    showMessage("BLE TEST 27.09","AUTH OK",
+                "BEZ ITS / 15s","AUTO RETRY OFF");
+    Serial.println("BLE PRE-FLIGHT OK: 15 seconds passive, NO ITS traffic");
+    return true;
+  }
 
   if (!setupDiagnosticTransport())
   {
@@ -2642,6 +2657,12 @@ bool startEverything()
 void serviceItsShutdown()
 {
   const uint32_t now=millis();
+  if(itsGuard.active() && bleProbeDeadlineMs != 0 &&
+     (int32_t)(now-bleProbeDeadlineMs)>=0)
+  {
+    bleProbeDeadlineMs=0;
+    stopDiagnosticPolling("BLE 15S PROBE DONE");
+  }
   if(itsGuard.sessionExpired(now))
     stopDiagnosticPolling("SESSION LIMIT 3 MIN");
   if(itsGuard.shouldClose(now))
@@ -2671,14 +2692,21 @@ void serviceItsShutdown()
       itsGuard.linkDown(now);
       transportConfigured=false;
       diagService=nullptr;diagFifo=nullptr;diagCredits=nullptr;
-      showMessage("ITS SAFE 27.08","BLE ZAKONCZONE",
-                  "AUTO RETRY OFF","BACK PO 60s");
+      if(bleProbeAuthOk)
+        showMessage("BLE TEST 27.09","AUTH OK / 15s",
+                    "BLE ZAKONCZONE","AUTO RETRY OFF");
+      else
+        showMessage("BLE TEST 27.09",
+                    scanNotFound ? "SCAN BRAK" :
+                    (bleProbeLinkOk ? "AUTH FAIL" : "CONNECT FAIL"),
+                    String("ERR: ")+bleProbeLastError,
+                    "AUTO RETRY OFF");
       Serial.println("ITS SAFE: down; cooldown; manual only");
     }
     else if(itsGuard.timedOut(now))
     {
       itsGuard.lock(now);
-      showMessage("ITS SAFE 27.08","BRAK ROZLACZ.",
+      showMessage("BLE TEST 27.09","BRAK ROZLACZ.",
                   "NIE WZNAWIAJ","BLE NIEPEWNE");
       Serial.println("ITS SAFE: disconnect not confirmed. Never rescan.");
     }
@@ -2695,7 +2723,7 @@ void restartConnection()
   }
   if(!itsGuard.canStart(now,client && client->isConnected()))
   {
-    showMessage("ITS SAFE 27.08","AUTO RETRY OFF",
+    showMessage("BLE TEST 27.09","AUTO RETRY OFF",
                 String("Przerwa ")+(itsGuard.remaining(now)/1000U)+"s",
                 "BACK PO CZASIE");
     return;
@@ -2817,9 +2845,9 @@ void setup()
   // No Wi-Fi or new diagnostic identifiers are initialized in normal mode.
   showMessage(
     "TrackBox G2",
-    "ITS SAFE 27.08",
-    "F902/F912 ONLY",
-    "MANUAL START"
+    "BLE TEST 27.09",
+    "BRAK ITS",
+    "BACK=1 PROBA"
   );
   delay(1200);
 
@@ -2853,7 +2881,7 @@ void setup()
 
 
   NimBLEDevice::setMTU(
-    23 // Minimal valid ATT_MTU for our short F902/F912 messages.
+    247 // Exact 27.06 MTU.
   );
 
 
@@ -2899,7 +2927,7 @@ void setup()
 
   diagnosticsPaused=true;
   state=ST_ERROR;
-  showMessage("ITS SAFE 27.08","AUTO START OFF","F902 / F912","BACK=START");
+  showMessage("BLE TEST 27.09","AUTO START OFF","BRAK ITS","BACK=START");
   Serial.println("ITS SAFE: no automatic connection on boot");
 }
 
@@ -3149,7 +3177,7 @@ void loop()
     itsGuard.linkDown(millis());
     state=ST_ERROR;
     if(!wasExpected)
-      showMessage("ITS SAFE 27.08","BLE ROZLACZONE",
+      showMessage("BLE TEST 27.09","BLE ROZLACZONE",
                   String("Reason: ")+lastBleDisconnectReason,
                   "AUTO RETRY OFF");
   }
@@ -3213,15 +3241,14 @@ void loop()
   {
     // The tachograph erased pairing; ESP32 may retain old keys.
     // Never erase silently: CONFIRM does it only on scan failure.
-    if (state == ST_ERROR && (scanNotFound || blePairingFailed))
+    if (state == ST_ERROR && blePairingFailed && !scanNotFound)
     {
       bool ok = NimBLEDevice::deleteAllBonds();
       Serial.printf("ESP bonds erased: %s\n", ok ? "YES" : "NO");
-      showMessage(
-        "TrackBox BLE RESET",
-        ok ? "Bonds cleared" : "Bonds failure",
-        "Ponowny skan..."
-      );
+      showMessage("BLE TEST 27.09",
+                  ok ? "ESP BONDS ERASED" : "ESP BONDS ERROR",
+                  "SPRAWDZ PAR. W TACHO",
+                  "BACK PO 60s");
       // Bond clear is explicit but does NOT automatically reconnect.
       Serial.println("Bonds erased; manual BACK required");
     }
