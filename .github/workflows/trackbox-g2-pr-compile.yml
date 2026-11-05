@@ -30,6 +30,9 @@ jobs:
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -pedantic -O2 trackbox-g2/tests/its_safety_guard_test.cpp -o /tmp/its_safety_test
           /tmp/its_safety_test
+      - name: BLE-only 27.09 preflight safety checks
+        run: |
+          python3 trackbox-g2/tests/ble_2709_preflight_static_test.py
       - name: Compile diagnostic prototype
         run: |
           arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" --output-dir build trackbox-g2/TrackBox_Gen2
