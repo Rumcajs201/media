@@ -60,6 +60,12 @@ jobs:
             exit 1
           fi
 
+          # Keep original 26.22 firmware unmodified; only OTA release metadata is newer.
+          if [ "$VERSION" = "2026.10.26.22-F902TRACE-TEST" ]; then
+            test "$(git hash-object trackbox-g2/TrackBox_Gen2/TrackBox_Gen2.ino)" = "db9f053add7fec3a04e61b2c98a2b11142196497"
+            VERSION="2026.11.19.26.22-ORIGINAL-OTA-TEST"
+          fi
+
           cp "$APP_BIN" trackbox-g2/firmware/latest.bin
           printf '%s\n' "$VERSION" > trackbox-g2/firmware/version.txt
           sha256sum trackbox-g2/firmware/latest.bin | awk '{print $1}' > trackbox-g2/firmware/latest.sha256
