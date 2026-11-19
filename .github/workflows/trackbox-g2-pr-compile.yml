@@ -30,15 +30,15 @@ jobs:
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -pedantic -O2 trackbox-g2/tests/its_safety_guard_test.cpp -o /tmp/its_safety_test
           /tmp/its_safety_test
-      - name: BLE-only 27.09 preflight safety checks
+      - name: Check byte-for-byte original 26.22
         run: |
-          python3 trackbox-g2/tests/ble_2709_preflight_static_test.py
+          test "$(git hash-object trackbox-g2/TrackBox_Gen2/TrackBox_Gen2.ino)" = "db9f053add7fec3a04e61b2c98a2b11142196497"
       - name: Compile diagnostic prototype
         run: |
           arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" --output-dir build trackbox-g2/TrackBox_Gen2
       - name: Upload BIN for manual test (never overwrite latest.bin)
         uses: actions/upload-artifact@v4
         with:
-          name: TrackBox_G2_27_09_BLE_PREFLIGHT_TEST
+          name: TrackBox_G2_ORIGINAL_26_22_ROLLBACK_TEST
           path: build/*.ino.bin
           retention-days: 14
